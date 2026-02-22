@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+users.db
+*.db
+
+# YOLO runs
+runs/
+*.pt
+
+# Videos
+*.mp4
+
+# Node
+node_modules/
+.next/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
