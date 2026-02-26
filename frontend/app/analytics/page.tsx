@@ -2,92 +2,125 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import AnalyticsPanel from "@/components/AnalyticsPanel";
-import AnalyticsSkeleton from "@/components/AnalyticsSkeleton";
-import { API_BASE, getToken, clearToken, isTokenExpired } from "@/lib/api";
+import { API_BASE, clearToken, getToken, isTokenExpired } from "@/lib/api";
+
+type Analytics = {
+  camera: string;
+  total_detections: number;
+  violations: number;
+  compliant: number;
+  most_common_label: string | null;
+  violation_percentage: number;
+};
+
+type CameraEntry = { id: string; name: string; mode: "upload" | "live"; streaming: boolean };
 
 export default function AnalyticsPage() {
   const router = useRouter();
-  const [cameras, setCameras] = useState<string[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [cameras, setCameras] = useState<CameraEntry[]>([]);
+  const [data, setData] = useState<Analytics[]>([]);
 
   const handleAuthError = () => {
     clearToken();
     router.push("/signin");
   };
 
-  const fetchCameras = async () => {
+  const getAuthToken = () => {
     const token = getToken();
-
-    if (isTokenExpired(token)) {
+    if (!token || isTokenExpired(token)) {
       handleAuthError();
-      return;
+      return null;
     }
-
-    try {
-      const res = await fetch(`${API_BASE}/cameras`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-
-      if (res.status === 401) return handleAuthError();
-
-      const data = await res.json();
-      const camList = Array.isArray(data.cameras)
-        ? data.cameras.map((c: any) => (typeof c === "string" ? c : c.name))
-        : [];
-
-      setCameras(camList);
-    } catch (error) {
-      console.error("Failed to fetch cameras:", error);
-    } finally {
-      setLoading(false);
-    }
+    return token;
   };
 
   useEffect(() => {
-    fetchCameras();
+    const load = async () => {
+      const token = getAuthToken();
+      if (!token) return;
+
+      const camsRes = await fetch(`${API_BASE}/cameras`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (camsRes.status === 401) return handleAuthError();
+
+      const camsJson = await camsRes.json();
+      const camList: CameraEntry[] = Array.isArray(camsJson.cameras)
+        ? camsJson.cameras.map((cam: any) =>
+            typeof cam === "string"
+              ? { id: cam, name: cam, mode: "upload", streaming: false }
+              : {
+                  id: cam.id ?? cam.name,
+                  name: cam.name ?? cam.id,
+                  mode: cam.mode === "live" ? "live" : "upload",
+                  streaming: !!cam.streaming,
+                },
+          )
+        : [];
+
+      setCameras(camList);
+
+      const analytics = await Promise.all(
+        camList.map(async (cam) => {
+          const res = await fetch(`${API_BASE}/analytics?cam=${encodeURIComponent(cam.id)}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (!res.ok) {
+            return {
+              camera: cam.id,
+              total_detections: 0,
+              violations: 0,
+              compliant: 0,
+              most_common_label: null,
+              violation_percentage: 0,
+            };
+          }
+          return (await res.json()) as Analytics;
+        }),
+      );
+
+      setData(analytics);
+    };
+
+    void load();
   }, []);
 
   return (
     <div className="min-h-screen bg-gray-50 p-8">
-      
-      {/* Header */}
-      <div className="mb-12">
-        <h1 className="text-3xl font-semibold text-gray-900 mb-2">
-          Analytics Overview
-        </h1>
-        <p className="text-gray-600">
-          View detailed detection analytics for your cameras
-        </p>
-      </div>
+      <h1 className="mb-2 text-3xl font-semibold text-gray-900">Analytics</h1>
+      <p className="mb-8 text-sm text-gray-600">Detection quality and violation trends per camera.</p>
 
-      {/* Loading State */}
-      {loading && (
-        <div className="space-y-12">
-          <AnalyticsSkeleton />
-          <AnalyticsSkeleton />
-        </div>
-      )}
-
-      {/* No Cameras */}
-      {!loading && cameras.length === 0 && (
-        <div className="flex items-center justify-center py-32">
-          <div className="text-center">
-            <p className="text-gray-600 text-lg mb-2">No cameras configured</p>
-            <p className="text-gray-500 text-sm">
-              Add cameras from the Camera Management page to view analytics
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Analytics Panels */}
-      {!loading && cameras.length > 0 && (
-        <div className="space-y-12">
-          {cameras.map((cam) => (
-            <div key={cam}>
-              <h2 className="text-lg font-semibold text-gray-900 mb-6">{cam}</h2>
-              <AnalyticsPanel key={cam} camId={cam} />
+      {cameras.length === 0 ? (
+        <div className="rounded-lg border border-gray-200 bg-white p-8 text-sm text-gray-600">No cameras found.</div>
+      ) : (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          {data.map((row) => (
+            <div key={row.camera} className="rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
+              <h2 className="mb-4 text-base font-semibold text-gray-900">
+                {cameras.find((c) => c.id === row.camera)?.name ?? row.camera}
+                <span className="ml-2 rounded bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700">
+                  {cameras.find((c) => c.id === row.camera)?.mode ?? "upload"}
+                </span>
+              </h2>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div className="rounded bg-gray-50 p-3">
+                  <p className="text-xs text-gray-500">Total detections</p>
+                  <p className="text-lg font-semibold text-gray-900">{row.total_detections}</p>
+                </div>
+                <div className="rounded bg-gray-50 p-3">
+                  <p className="text-xs text-gray-500">Violations</p>
+                  <p className="text-lg font-semibold text-gray-900">{row.violations}</p>
+                </div>
+                <div className="rounded bg-gray-50 p-3">
+                  <p className="text-xs text-gray-500">Compliant</p>
+                  <p className="text-lg font-semibold text-gray-900">{row.compliant}</p>
+                </div>
+                <div className="rounded bg-gray-50 p-3">
+                  <p className="text-xs text-gray-500">Violation %</p>
+                  <p className="text-lg font-semibold text-gray-900">{row.violation_percentage}%</p>
+                </div>
+              </div>
+              <p className="mt-3 text-xs text-gray-500">Most common label: {row.most_common_label ?? "-"}</p>
             </div>
           ))}
         </div>

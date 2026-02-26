@@ -1,44 +1,39 @@
-import cv2
-import os
-import time
-import threading
-from datetime import datetime, timedelta
+from __future__ import annotations
+
 import asyncio
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
-from fastapi.responses import StreamingResponse
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import torch
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from jose import jwt, JWTError
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import jwt
 from pydantic import BaseModel
-
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 from ultralytics import YOLO
 
-from models_db import SessionLocal, User, Violation, Camera
-import hashlib
+from models_db import Camera, SessionLocal, User, Violation
+from schemas import AlarmResponse, InferResponse
+from workers import InferenceWorker
 
-# =========================================================
-# CONFIG
-# =========================================================
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
 ALGORITHM = "HS256"
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+FALL_CLASS = os.getenv("FALL_CLASS", "Fall-Detected")
+MAX_METADATA_STALENESS_SEC = float(os.getenv("MAX_METADATA_STALENESS_SEC", "1.0"))
 
-app = FastAPI()
+app = FastAPI(title="PPE + Fall Detection API")
 security = HTTPBearer()
-
-
-# =========================================================
-# CORS
-# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -46,171 +41,79 @@ app.add_middleware(
 )
 
 
-# =========================================================
-# YOLO MODELS (GPU if available)
-# =========================================================
+# GPU is mandatory for this architecture.
+if not torch.cuda.is_available():
+    raise RuntimeError("GPU inference is mandatory. CUDA device not available.")
 
-model_ppe = YOLO("best.pt")
-model_fall = YOLO("last.pt")
-USE_GPU = False
+model_ppe = YOLO(os.getenv("PPE_MODEL_PATH", "best.pt"))
+model_fall = YOLO(os.getenv("FALL_MODEL_PATH", "last.pt"))
+model_ppe.to("cuda")
+model_fall.to("cuda")
 try:
-    model_ppe.to("cuda")
-    model_fall.to("cuda")
-    USE_GPU = True
-    print("GPU active ✔")
+    model_ppe.model.half()
+    model_fall.model.half()
 except Exception:
-    try:
-        model_ppe.to("cpu")
-        model_fall.to("cpu")
-    except Exception:
-        pass
-    USE_GPU = False
-    print("CPU mode ❗ (GPU unavailable)")
-    
-# Log model class names for debugging fall detection mapping
-try:
-    print("PPE model classes:", model_ppe.names)
-    print("Fall model classes:", model_fall.names)
-except Exception as e:
-    print("Error printing model names:", str(e))
-
-# ================= LIVE CAMERA STORES =================
-
-live_raw_frames = {}          # camId -> latest raw frame
-live_raw_locks = {}           # camId -> lock for raw frame
-live_grabber_active = {}      # camId -> bool
-
-def live_frame_grabber(camId, device_index):
-    cap = cv2.VideoCapture(device_index)
-
-    # Force stable resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    while live_grabber_active.get(camId, False):
-        cap.grab()
-        ret, frame = cap.retrieve()
-
-        if not ret:
-            continue
-
-        frame = cv2.resize(frame, (640, 480))
-
-        with live_raw_locks[camId]:
-            live_raw_frames[camId] = frame
-
-        time.sleep(0.001)
-
-    cap.release()
-
-def live_detection_worker(camId):
-    frame_count = 0
-
-    # Enable FP16 if GPU
-    if USE_GPU:
-        model_ppe.model.half()
-        model_fall.model.half()
-
-    while live_grabber_active.get(camId, False):
-
-        with live_raw_locks[camId]:
-            frame = live_raw_frames.get(camId)
-
-        if frame is None:
-            time.sleep(0.005)
-            continue
-
-        if frame_count % BALANCED_INTERVAL == 0:
-
-            # GPU inference
-            ppe_res = model_ppe(frame, conf=0.5, verbose=False)
-            fall_res = model_fall(frame, conf=0.5, verbose=False)
-
-            annotated = draw_boxes(frame, ppe_res, fall_res)
-
-            detected_labels = set()
-            fall_found = False
-
-            # PPE labels
-            if ppe_res[0].boxes is not None:
-                for box in ppe_res[0].boxes:
-                    detected_labels.add(model_ppe.names[int(box.cls)])
-
-            # FALL labels
-            if fall_res[0].boxes is not None:
-                for box in fall_res[0].boxes:
-                    cls = model_fall.names[int(box.cls)]
-                    detected_labels.add(cls)
-                    if cls == FALL_CLASS:
-                        fall_found = True
-
-            now = datetime.utcnow()
-
-            # Save logs
-            for lbl in detected_labels:
-                if lbl != FALL_CLASS:
-                    recent_logs_store[camId].append({
-                        "message": lbl,
-                        "time": now.strftime("%H:%M:%S")
-                    })
-
-            # Fall confirmation logic
-            if fall_found:
-                entry = fall_detected_store.get(camId, {})
-                last_alerted = entry.get("last_alerted")
-
-                if not last_alerted or (now - last_alerted).total_seconds() > FALL_ALERT_COOLDOWN:
-                    fall_detected_store[camId] = {
-                        "detected": True,
-                        "timestamp": now.isoformat(),
-                        "last_alerted": now,
-                        "acknowledged": False
-                    }
-
-            # Update stream frame
-            with frame_locks[camId]:
-                latest_frames[camId] = annotated
-
-        frame_count += 1
-        time.sleep(0.002)
-
-# =========================================================
-# MEMORY STORES
-# =========================================================
-
-camera_sources = {}
-camera_active = {}
-latest_frames = {}
-frame_locks = {}
-
-recent_logs_store = {}
-fall_detected_store = {}
-
-# NEW: last saved timestamp per label
-last_saved_store = {}   # camId -> { label -> timestamp }
-
-# Fall alert debouncing and confirmation
-fall_counter_store = {}     # camId -> consecutive fall detections
-FALL_CONFIRMATION_COUNT = 2  # require N consecutive detections to confirm a fall
-FALL_ALERT_COOLDOWN = 30     # seconds to wait before re-alerting for same camera
+    pass
 
 
-BALANCED_INTERVAL = 3
-SAVE_INTERVAL_SECONDS = 10  # save each label at most every 10 seconds
+workers: dict[str, InferenceWorker] = {}
+fall_detected_store: dict[str, dict[str, Any]] = {}
+CAMERA_MODES = {"upload", "live"}
+FALL_CLEAR_REQUIRED_FRAMES = 2
 
-FALL_CLASS = "Fall-Detected"
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-# =========================================================
-# HELPERS
-# =========================================================
+def default_alarm_state() -> dict[str, Any]:
+    return {
+        "detected": False,
+        "timestamp": None,
+        "acknowledged": False,
+        "last_alerted": None,
+        "active": False,
+        "clear_frames": 0,
+        "incident": 0,
+    }
 
-def hash_password(password: str):
+
+def update_alarm_state(cam_id: str, fall_detected: bool, timestamp: str) -> None:
+    state = fall_detected_store.setdefault(cam_id, default_alarm_state())
+
+    if fall_detected:
+        state["clear_frames"] = 0
+
+        # New incident starts on a rising edge.
+        if not state.get("active", False):
+            state["active"] = True
+            state["acknowledged"] = False
+            state["detected"] = True
+            state["timestamp"] = timestamp
+            state["last_alerted"] = timestamp
+            state["incident"] = int(state.get("incident", 0)) + 1
+        elif not state.get("acknowledged", False):
+            state["detected"] = True
+    else:
+        clear_frames = int(state.get("clear_frames", 0)) + 1
+        state["clear_frames"] = clear_frames
+        if clear_frames >= FALL_CLEAR_REQUIRED_FRAMES:
+            state["active"] = False
+            state["detected"] = False
+            state["acknowledged"] = False
+
+
+def hash_password(password: str) -> str:
+    import hashlib
+
     return hashlib.sha256(password.encode()).hexdigest()
 
-def verify_password(password: str, hashed: str):
+
+def verify_password(password: str, hashed: str) -> bool:
+    import hashlib
+
     return hashlib.sha256(password.encode()).hexdigest() == hashed
+
 
 def get_db():
     db = SessionLocal()
@@ -219,442 +122,257 @@ def get_db():
     finally:
         db.close()
 
-from fastapi import WebSocket, WebSocketDisconnect
 
-@app.websocket("/ws/video")
-async def video_ws(ws: WebSocket):
-    await ws.accept()
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return username
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
 
-    camId = ws.query_params.get("cam")
-    token = ws.query_params.get("token")
 
-    # Validate camera
-    if camId not in camera_active:
-        await ws.close()
+def validate_ws_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except Exception:
+        return None
+
+
+def ensure_camera(db: Session, cam_id: str) -> None:
+    cam = db.query(Camera).filter(Camera.name == cam_id).first()
+    if cam is None:
+        db.add(Camera(name=cam_id))
+        db.commit()
+
+
+def parse_camera_id(camera_id: str) -> tuple[str, str]:
+    if "::" not in camera_id:
+        return "upload", camera_id
+
+    maybe_mode, raw_name = camera_id.split("::", 1)
+    mode = maybe_mode if maybe_mode in CAMERA_MODES else "upload"
+    return mode, raw_name
+
+
+def make_camera_id(name: str, mode: str) -> str:
+    safe_mode = mode if mode in CAMERA_MODES else "upload"
+    return f"{safe_mode}::{name.strip()}"
+
+
+def get_worker(cam_id: str) -> InferenceWorker:
+    worker = workers.get(cam_id)
+    if worker:
+        return worker
+
+    worker = InferenceWorker(
+        camera_id=cam_id,
+        ppe_model=model_ppe,
+        fall_model=model_fall,
+        fall_class=FALL_CLASS,
+        redis_url=REDIS_URL,
+    )
+    worker.start()
+    workers[cam_id] = worker
+    fall_detected_store.setdefault(cam_id, default_alarm_state())
+    return worker
+
+
+def persist_detections(cam_id: str, dets: list[dict[str, Any]]) -> None:
+    if not dets:
         return
 
+    db = SessionLocal()
     try:
-        while camera_active.get(camId, False):
-            # Get latest frame
-            with frame_locks[camId]:
-                frame = latest_frames.get(camId)
+        now = datetime.utcnow()
+        for det in dets:
+            db.add(
+                Violation(
+                    camera_id=cam_id,
+                    label=det["label"],
+                    timestamp=now,
+                    username=None,
+                )
+            )
+        db.commit()
+    finally:
+        db.close()
 
-            if frame is None:
-                await asyncio.sleep(0.01)
-                continue
-
-            # Encode as JPEG
-            ret, buffer = cv2.imencode(".jpg", frame)
-            if not ret:
-                continue
-
-            await ws.send_bytes(buffer.tobytes())
-            await asyncio.sleep(0.03)  # ~30 FPS
-
-    except WebSocketDisconnect:
-        print(f"WebSocket disconnected: {camId}")
-    except Exception as e:
-        print("WS error:", e)
-
-# =========================================================
-# AUTH
-# =========================================================
 
 class AuthSchema(BaseModel):
     username: str
     password: str
 
+
+@app.on_event("shutdown")
+def shutdown_workers() -> None:
+    for worker in workers.values():
+        worker.stop()
+
+
 @app.post("/signup")
 def signup(data: AuthSchema, db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == data.username).first():
-        raise HTTPException(400, "User already exists")
-    user = User(username=data.username, hashed_password=hash_password(data.password))
-    db.add(user)
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    db.add(User(username=data.username, hashed_password=hash_password(data.password)))
     db.commit()
     return {"message": "User created"}
+
 
 @app.post("/signin")
 def signin(data: AuthSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == data.username).first()
     if not user or not verify_password(data.password, user.hashed_password):
-        raise HTTPException(400, "Invalid credentials")
+        raise HTTPException(status_code=400, detail="Invalid credentials")
 
     expire = datetime.utcnow() + timedelta(hours=2)
     token = jwt.encode({"sub": user.username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": token}
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise HTTPException(401, "Invalid token")
-        return username
-    except Exception:
-        raise HTTPException(401, "Invalid token")
-
-
-# =========================================================
-# DRAWING BOXES
-# =========================================================
-
-def draw_boxes(frame, ppe_res, fall_res):
-    annotated = ppe_res[0].plot(img=frame.copy())  # PPE with YOLO default colors
-
-    violet = (180, 50, 200)
-    if fall_res[0].boxes is not None:
-        for box in fall_res[0].boxes:
-            cls_name = fall_res[0].names[int(box.cls)]
-            if cls_name == FALL_CLASS:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), violet, 2)
-                cv2.putText(
-                    annotated,
-                    f"{cls_name} {box.conf.item():.2f}",
-                    (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255,255,255),
-                    2
-                )
-    return annotated
-
-
-# =========================================================
-# DETECTION WORKER (thread per camera)
-# =========================================================
-
-def detection_worker(camId):
-    cap = cv2.VideoCapture(camera_sources[camId])
-    frame_count = 0
-    last_annotated = None
-    prev_frame_idx = -1
-
-    last_saved_store[camId] = {}  # init dictionary
-
-    while camera_active.get(camId, False):
-
-        ok, frame = cap.read()
-        if not ok:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue
-        # detect if video looped (frame index decreased or reset)
-        try:
-            curr_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            if prev_frame_idx != -1 and curr_idx <= prev_frame_idx:
-                # video looped — reset fall counters and allow new alerts
-                try:
-                    fall_counter_store[camId] = 0
-                except Exception:
-                    pass
-                try:
-                    if camId in fall_detected_store:
-                        fall_detected_store[camId]["last_alerted"] = None
-                        fall_detected_store[camId]["acknowledged"] = False
-                except Exception:
-                    pass
-                try:
-                    last_saved_store[camId] = {}
-                except Exception:
-                    pass
-            prev_frame_idx = curr_idx
-        except Exception:
-            # ignore frame index errors (can't detect loop)
-            pass
-
-        frame = cv2.resize(frame, (640, 480))
-
-        # Run inference every 3 frames
-        if frame_count % BALANCED_INTERVAL == 0:
-
-            ppe_res = model_ppe(frame, conf=0.5)
-            fall_res = model_fall(frame, conf=0.5)
-
-            annotated = draw_boxes(frame, ppe_res, fall_res)
-            last_annotated = annotated
-
-            detected_labels = set()
-            fall_found = False
-
-            # PPE
-            if ppe_res[0].boxes is not None:
-                for box in ppe_res[0].boxes:
-                    detected_labels.add(model_ppe.names[int(box.cls)])
-
-            # FALL
-            if fall_res[0].boxes is not None:
-                for box in fall_res[0].boxes:
-                    cls = model_fall.names[int(box.cls)]
-                    detected_labels.add(cls)
-                    if cls == FALL_CLASS:
-                        fall_found = True
-
-            # Also treat a fall if any model (PPE or Fall) produced the FALL_CLASS label
-            try:
-                if any(lbl == FALL_CLASS for lbl in detected_labels):
-                    fall_found = True
-            except Exception:
-                pass
-            
-            # Debug: log detected labels occasionally (once every 10 inferences)
-            try:
-                if frame_count % (BALANCED_INTERVAL * 10) == 0:
-                    print(f"[DEBUG] cam={camId} labels={detected_labels} fall_found={fall_found}")
-                if fall_found:
-                    print(f"[ALERT] Fall detected on {camId} labels={detected_labels}")
-            except Exception as e:
-                print("Error logging detection debug:", str(e))
-
-            # ===== SAVE detections (compliant + violations) =====
-            now = datetime.utcnow()
-
-            try:
-                db = SessionLocal()
-                for lbl in detected_labels:
-
-                    last_ts = last_saved_store[camId].get(lbl)
-
-                    # If never saved or saved long ago → save again
-                    if not last_ts or (now - last_ts).total_seconds() >= SAVE_INTERVAL_SECONDS:
-
-                        db.add(Violation(
-                            camera_id=camId,
-                            label=lbl,
-                            timestamp=now,
-                            username=None
-                        ))
-
-                        last_saved_store[camId][lbl] = now
-
-                        # Add to recent logs (frontend) — skip fall alerts so UI handles them separately
-                        if lbl != FALL_CLASS:
-                            recent_logs_store[camId].append({
-                                "message": lbl,
-                                "time": now.strftime("%H:%M:%S")
-                            })
-
-                db.commit()
-                db.close()
-
-            except Exception as e:
-                print("DB write error:", str(e))
-
-            # FALL alarm: require confirmation and apply cooldown to avoid repeated alerts
-            if fall_found:
-                fall_counter_store[camId] = fall_counter_store.get(camId, 0) + 1
-            else:
-                fall_counter_store[camId] = 0
-
-            confirmed_fall = fall_counter_store.get(camId, 0) >= FALL_CONFIRMATION_COUNT
-
-            if confirmed_fall:
-                now = datetime.utcnow()
-                entry = fall_detected_store.get(camId, {})
-                last_alerted = entry.get("last_alerted")
-                acknowledged = entry.get("acknowledged", False)
-
-                # only set detected True when not acknowledged and cooldown passed
-                if (not acknowledged) and ((not last_alerted) or (now - last_alerted).total_seconds() >= FALL_ALERT_COOLDOWN):
-                    fall_detected_store[camId] = {
-                        "detected": True,
-                        "timestamp": now.isoformat(),
-                        "last_alerted": now,
-                        "acknowledged": False,
-                    }
-
-            # Store frame
-            with frame_locks[camId]:
-                latest_frames[camId] = last_annotated
-
-        frame_count += 1
-        time.sleep(0.01)
-
-    cap.release()
-
-
-# =========================================================
-# STREAM
-# =========================================================
-
-def generate_frames(camId):
-    while camera_active.get(camId, False):
-
-        with frame_locks[camId]:
-            frame = latest_frames.get(camId)
-
-        if frame is None:
-            time.sleep(0.01)
-            continue
-
-        ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 40])
-        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
-
-        time.sleep(0.03)
-
-
-# =========================================================
-# API ENDPOINTS (unchanged for frontend)
-# =========================================================
 
 @app.post("/upload")
-async def upload_video(video: UploadFile = File(...), camId: str = "", user: str = Depends(get_current_user)):
+async def upload_video(
+    video: UploadFile = File(...),
+    camId: str = Query(..., min_length=1),
+    user: str = Depends(get_current_user),
+):
+    # Upload endpoint now only initializes pipeline metadata state.
+    # Video bytes are intentionally not streamed back by backend.
+    _ = await video.read()
+    db = SessionLocal()
+    try:
+        ensure_camera(db, camId)
+    finally:
+        db.close()
 
-    if camId == "":
-        raise HTTPException(400, "camId required")
-
-    filepath = f"{camId}.mp4"
-    with open(filepath, "wb") as f:
-        f.write(await video.read())
-
-    camera_sources[camId] = filepath
-    camera_active[camId] = True
-
-    latest_frames[camId] = None
-    recent_logs_store[camId] = []
-    fall_detected_store[camId] = {"detected": False, "last_alerted": None, "acknowledged": False}
-    frame_locks[camId] = threading.Lock()
-
-    threading.Thread(target=detection_worker, args=(camId,), daemon=True).start()
-
-    return {"status": "uploaded"}
+    get_worker(camId)
+    return {"status": "pipeline-ready", "camId": camId, "timestamp": utc_now_iso()}
 
 
-@app.post("/start_local")
-def start_local_camera(name: str, device: int = 0, db: Session = Depends(get_db), user: str = Depends(get_current_user)):
-    """Start a system/local camera device (e.g. device=0) as a named camera.
-
-    - `name`: camera name to register and use
-    - `device`: OS camera device index (0,1,...)
-    """
-    # ensure camera exists in DB
-    cam = db.query(Camera).filter(Camera.name == name).first()
-    if not cam:
-        cam = Camera(name=name)
-        db.add(cam)
-        db.commit()
-
-    # if already active, return error
-    if camera_active.get(name):
-        raise HTTPException(status_code=400, detail="Camera already active")
-
-    # set up the device as the source (OpenCV accepts integer device index)
-    camera_sources[name] = int(device)
-    camera_active[name] = True
-    latest_frames[name] = None
-    recent_logs_store[name] = []
-    fall_detected_store[name] = {"detected": False, "last_alerted": None, "acknowledged": False}
-    frame_locks[name] = threading.Lock()
-    last_saved_store[name] = {}
-
-    threading.Thread(target=detection_worker, args=(name,), daemon=True).start()
-
-    return {"message": f"Local camera '{name}' started on device {device}"}
+@app.post("/start_video")
+async def start_video_alias(
+    video: UploadFile = File(...),
+    camId: str = Query(..., min_length=1),
+    user: str = Depends(get_current_user),
+):
+    return await upload_video(video=video, camId=camId, user=user)
 
 
-@app.get("/discover_devices")
-def discover_devices(max_index: int = 5, user: str = Depends(get_current_user)):
-    """Probe system camera device indexes 0..max_index and return available ones."""
-    available = []
-    for i in range(0, max_index + 1):
+@app.websocket("/ws/infer")
+async def ws_infer(ws: WebSocket):
+    await ws.accept()
+
+    cam_id = ws.query_params.get("cam") or "default"
+    token = ws.query_params.get("token")
+    _username = validate_ws_token(token)
+
+    worker = get_worker(cam_id)
+
+    while True:
         try:
-            cap = cv2.VideoCapture(i)
-            ok, _ = cap.read()
-            cap.release()
-            if ok:
-                available.append({"device": i, "label": f"Device {i}"})
+            frame_bytes = await ws.receive_bytes()
+            seq = worker.submit(frame_bytes)
+            metadata = worker.await_result(seq, timeout=2.5)
+            if metadata is None:
+                latest = worker.latest_metadata()
+                if latest is not None:
+                    try:
+                        ts = latest.get("timestamp")
+                        if ts:
+                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            age = (datetime.now(timezone.utc) - dt).total_seconds()
+                        else:
+                            age = MAX_METADATA_STALENESS_SEC + 1
+                    except Exception:
+                        age = MAX_METADATA_STALENESS_SEC + 1
+
+                    if age <= MAX_METADATA_STALENESS_SEC:
+                        metadata = latest
+                    else:
+                        metadata = InferResponse(
+                            dets=[],
+                            fall_detected=False,
+                            timestamp=utc_now_iso(),
+                            frame_width=None,
+                            frame_height=None,
+                        ).model_dump()
+                else:
+                    metadata = InferResponse(
+                        dets=[],
+                        fall_detected=False,
+                        timestamp=utc_now_iso(),
+                        frame_width=None,
+                        frame_height=None,
+                    ).model_dump()
+
+            to_persist = metadata.get("events") or []
+            if to_persist:
+                persist_detections(cam_id, to_persist)
+            update_alarm_state(
+                cam_id=cam_id,
+                fall_detected=bool(metadata.get("fall_detected")),
+                timestamp=metadata.get("timestamp", utc_now_iso()),
+            )
+
+            await ws.send_json(metadata)
+        except WebSocketDisconnect:
+            break
         except Exception:
-            try:
-                cap.release()
-            except:
-                pass
-    return {"devices": available}
+            await asyncio.sleep(0.01)
 
 
 @app.get("/compute_mode")
 def compute_mode(user: str = Depends(get_current_user)):
-    """Return whether models are running on GPU or CPU."""
-    return {"compute": "gpu" if USE_GPU else "cpu"}
-
-
-@app.get("/camera_status")
-def camera_status(cam: str, user: str = Depends(get_current_user)):
-    """Return status for a named camera: active, streaming source, and last alert info."""
-    if cam not in camera_sources and cam not in [c.name for c in SessionLocal().query(Camera).all()]:
-        raise HTTPException(status_code=404, detail="Camera not found")
-
-    active = camera_active.get(cam, False)
-    source = camera_sources.get(cam)
-    last = fall_detected_store.get(cam, {})
-    return {
-        "camera": cam,
-        "active": bool(active),
-        "source": source,
-        "last_alert": last.get("timestamp"),
-        "acknowledged": bool(last.get("acknowledged", False)),
-    }
-
-
-@app.get("/video_feed")
-def video_feed(cam: str):
-    if cam not in camera_sources:
-        raise HTTPException(404, "Camera not found")
-    return StreamingResponse(
-        generate_frames(cam),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
-
-
-@app.post("/stop")
-def stop_video(camId: str):
-    if camId not in camera_sources:
-        raise HTTPException(404, "Camera not found")
-
-    camera_active[camId] = False
-    time.sleep(0.1)
-
-    camera_sources.pop(camId, None)
-    latest_frames.pop(camId, None)
-    recent_logs_store.pop(camId, None)
-    fall_detected_store.pop(camId, None)
-
-    try:
-        os.remove(f"{camId}.mp4")
-    except:
-        pass
-
-    return {"message": "Video stopped and deleted"}
+    return {"compute": "gpu"}
 
 
 @app.get("/violations")
-def get_violations(cam: str):
-    logs = recent_logs_store.get(cam, [])
-    recent_logs_store[cam] = []
-    return {"violations": logs}
+def get_violations(cam: str, db: Session = Depends(get_db), user: str = Depends(get_current_user)):
+    rows = (
+        db.query(Violation)
+        .filter(Violation.camera_id == cam)
+        .order_by(Violation.timestamp.desc())
+        .limit(50)
+        .all()
+    )
+    return {
+        "violations": [
+            {"message": row.label, "time": row.timestamp.strftime("%H:%M:%S")} for row in rows
+        ]
+    }
 
 
 @app.get("/history")
-def get_history(cam: str, db: Session = Depends(get_db)):
-    rows = db.query(Violation).filter(Violation.camera_id == cam).order_by(
-        Violation.timestamp.desc()).limit(50).all()
+def get_history(cam: str, db: Session = Depends(get_db), user: str = Depends(get_current_user)):
+    rows = (
+        db.query(Violation)
+        .filter(Violation.camera_id == cam)
+        .order_by(Violation.timestamp.desc())
+        .limit(100)
+        .all()
+    )
     return {
         "history": [
-            {"message": r.label, "time": r.timestamp.strftime("%H:%M:%S")}
-            for r in rows
+            {"message": row.label, "time": row.timestamp.strftime("%H:%M:%S")} for row in rows
         ]
     }
 
 
 @app.get("/analytics")
-def get_analytics(cam: str, db: Session = Depends(get_db)):
-
+def get_analytics(cam: str, db: Session = Depends(get_db), user: str = Depends(get_current_user)):
     total = db.query(Violation).filter(Violation.camera_id == cam).count()
-    violation_count = db.query(Violation).filter(
-        Violation.camera_id == cam,
-        Violation.label.like("NO-%")
-    ).count()
-
+    violation_count = (
+        db.query(Violation)
+        .filter(Violation.camera_id == cam, Violation.label.like("NO-%"))
+        .count()
+    )
     compliant = total - violation_count
-
     most_common = (
         db.query(Violation.label, func.count(Violation.label))
         .filter(Violation.camera_id == cam)
@@ -662,8 +380,7 @@ def get_analytics(cam: str, db: Session = Depends(get_db)):
         .order_by(func.count(Violation.label).desc())
         .first()
     )
-
-    percent = round((violation_count / total * 100), 2) if total > 0 else 0
+    percent = round((violation_count / total * 100), 2) if total else 0
 
     return {
         "camera": cam,
@@ -671,98 +388,88 @@ def get_analytics(cam: str, db: Session = Depends(get_db)):
         "violations": violation_count,
         "compliant": compliant,
         "most_common_label": most_common[0] if most_common else None,
-        "violation_percentage": percent
+        "violation_percentage": percent,
     }
 
 
-@app.get("/alarm")
-def get_alarm(cam: str):
-    data = fall_detected_store.get(cam, {"detected": False, "acknowledged": False})
-    return {
-        "alarm": bool(data.get("detected", False)),
-        "timestamp": data.get("timestamp"),
-        "acknowledged": bool(data.get("acknowledged", False)),
-        "message": "Fall detected!" if data.get("detected") else "No fall detected"
-    }
+@app.get("/alarm", response_model=AlarmResponse)
+def get_alarm(cam: str, user: str = Depends(get_current_user)):
+    data = fall_detected_store.get(cam, default_alarm_state())
+    return AlarmResponse(
+        alarm=bool(data.get("detected", False)),
+        timestamp=data.get("timestamp"),
+        acknowledged=bool(data.get("acknowledged", False)),
+        message="Fall detected!" if data.get("detected", False) else "No fall detected",
+    )
 
 
 @app.post("/alarm/acknowledge")
-def ack_alarm(cam: str):
-    if cam in fall_detected_store:
-        # mark acknowledged and clear detected flag so UI won't re-alert
-        fall_detected_store[cam]["acknowledged"] = True
-        fall_detected_store[cam]["detected"] = False
-        # record ack time
-        fall_detected_store[cam]["ack_time"] = datetime.utcnow().isoformat()
+def acknowledge_alarm(cam: str, user: str = Depends(get_current_user)):
+    state = fall_detected_store.setdefault(cam, default_alarm_state())
+    state["detected"] = False
+    state["acknowledged"] = True
+    state["ack_time"] = utc_now_iso()
     return {"message": "Alarm acknowledged"}
 
 
 @app.get("/cameras")
-def list_cameras(db: Session = Depends(get_db)):
+def list_cameras(db: Session = Depends(get_db), user: str = Depends(get_current_user)):
     cams = db.query(Camera).all()
+    out = []
+    for cam in cams:
+        mode, raw_name = parse_camera_id(cam.name)
+        out.append(
+            {
+                "id": cam.name,
+                "name": raw_name,
+                "mode": mode,
+                "streaming": cam.name in workers,
+            }
+        )
     return {
-        "cameras": [
-            {"name": c.name, "streaming": c.name in camera_sources}
-            for c in cams
-        ]
+        "cameras": out
     }
 
 
 @app.post("/cameras")
-def create_camera(name: str, db: Session = Depends(get_db)):
-    if db.query(Camera).filter(Camera.name == name).first():
-        raise HTTPException(400, "Camera exists")
-    db.add(Camera(name=name))
+def create_camera(
+    name: str,
+    mode: str = Query("upload"),
+    db: Session = Depends(get_db),
+    user: str = Depends(get_current_user),
+):
+    safe_mode = mode if mode in CAMERA_MODES else "upload"
+    camera_id = make_camera_id(name, safe_mode)
+    if db.query(Camera).filter(Camera.name == camera_id).first():
+        raise HTTPException(status_code=400, detail="Camera exists")
+    db.add(Camera(name=camera_id))
     db.commit()
-    return {"message": "Camera created"}
+    return {"message": "Camera created", "id": camera_id, "name": name.strip(), "mode": safe_mode}
 
 
 @app.delete("/cameras/{name}")
-def delete_camera(name: str, db: Session = Depends(get_db)):
+def delete_camera(name: str, db: Session = Depends(get_db), user: str = Depends(get_current_user)):
     cam = db.query(Camera).filter(Camera.name == name).first()
     if not cam:
-        raise HTTPException(404, "Camera not found")
+        raise HTTPException(status_code=404, detail="Camera not found")
 
-    camera_active[name] = False
-    time.sleep(0.1)
+    worker = workers.pop(name, None)
+    if worker:
+        worker.stop()
 
     db.query(Violation).filter(Violation.camera_id == name).delete()
     db.delete(cam)
     db.commit()
 
-    for store in [camera_sources, latest_frames, recent_logs_store, fall_detected_store]:
-        store.pop(name, None)
-
-    try:
-        os.remove(f"{name}.mp4")
-    except:
-        pass
-
+    fall_detected_store.pop(name, None)
     return {"message": "Camera deleted"}
 
 
 @app.post("/stop")
-def stop_video(camId: str):
-    # Stop uploaded-video or live camera
-    camera_active[camId] = False
-    live_grabber_active[camId] = False   # 🔥 NEW — stops live camera thread
+def stop_camera(camId: str, user: str = Depends(get_current_user)):
+    worker = workers.pop(camId, None)
+    if worker:
+        worker.stop()
 
-    time.sleep(0.1)
-
-    # Cleanup memory stores
-    camera_sources.pop(camId, None)
-    live_raw_frames.pop(camId, None)
-    live_raw_locks.pop(camId, None)
-
-    latest_frames.pop(camId, None)
-    frame_locks.pop(camId, None)
-    recent_logs_store.pop(camId, None)
     fall_detected_store.pop(camId, None)
-
-    # Remove saved uploaded video file (if exists)
-    try:
-        os.remove(f"{camId}.mp4")
-    except:
-        pass
-
-    return {"message": "Camera stopped and deleted"}
+    return {"message": "Camera stopped"}

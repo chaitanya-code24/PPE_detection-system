@@ -1,353 +1,356 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
-import {
-  API_BASE,
-  getToken,
-  clearToken,
-  isTokenExpired,
-} from "@/lib/api";
-
+import { API_BASE, clearToken, getToken, isTokenExpired } from "@/lib/api";
 import FallAlert from "@/components/FallAlert";
+import MetadataRenderer from "@/components/MetadataRenderer";
+import { InferMetadata, createInferSocket, sendCanvasFrame } from "@/lib/wsClient";
+import { clearUploadSession, getUploadSession, setUploadAutoStart, setUploadSession } from "@/lib/streamSession";
 
-// FallAlert imported from components/FallAlert (renders via portal)
+const SEND_INTERVAL_MS = 200;
 
+type VideoTileProps = {
+  camId: string;
+  title?: string;
+  addLog?: (camera: string, message: string, time?: string) => void;
+  onStreamStart?: (camera: string) => void;
+  onStreamStop?: (camera: string) => void;
+};
 
-export default function VideoTile({
-  camId,
-  addLog,
-  onStreamStart,
-  onStreamStop,
-}: any) {
+function VideoTile({ camId, title, addLog, onStreamStart, onStreamStop }: VideoTileProps) {
   const router = useRouter();
-
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const lastSentAtRef = useRef(0);
+  const awaitingResultRef = useRef(false);
+  const lastLabelAtRef = useRef<Map<string, number>>(new Map());
+  const shouldRunRef = useRef(false);
+  const runningRef = useRef(false);
+  const acknowledgedFallRef = useRef(false);
+  const fallTrueCountRef = useRef(0);
+  const fallFalseCountRef = useRef(0);
+  const lastPopupAtRef = useRef(0);
 
-  const [hasStream, setHasStream] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  const [isStopping, setIsStopping] = useState(false);
-  const [computeMode, setComputeMode] = useState<string | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(() => getUploadSession(camId)?.videoUrl ?? null);
+  const [metadata, setMetadata] = useState<InferMetadata | null>(null);
+  const [running, setRunning] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [showAlert, setShowAlert] = useState(false);
+  const showAlertRef = useRef(false);
+  const [connection, setConnection] = useState<"idle" | "connecting" | "open" | "closed">("idle");
 
-  const [fallAlertVisible, setFallAlertVisible] = useState(false);
-  const stopAlarmRef = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    showAlertRef.current = showAlert;
+  }, [showAlert]);
 
-  const handleAuthError = () => {
+  useEffect(() => {
+    runningRef.current = running;
+  }, [running]);
+
+  const handleAuthError = useCallback(() => {
     clearToken();
     router.push("/signin");
-  };
+  }, [router]);
 
-  // ==========================
-  // 🔊 ALARM PLAYER (10 sec)
-  // ==========================
-  const playAlarmFor10Seconds = () => {
-    const audio = new Audio("/sounds/alarm.mp3"); // FIXED PATH
-    audio.loop = true;
-    audio.volume = 1.0;
-
-    audio.play().catch(() => {
-      console.warn("Autoplay blocked");
-    });
-
-    const stop = () => {
-      audio.pause();
-      audio.currentTime = 0;
-    };
-
-    setTimeout(stop, 10000);
-    return stop;
-  };
-
-  // ==========================
-  // 🧠 RESTORE STREAM STATUS
-  // ==========================
-  const checkStreamStatus = async () => {
-    const token = getToken();
-    if (!token || isTokenExpired(token)) return handleAuthError();
-
-    const res = await fetch(`${API_BASE}/cameras`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    const data = await res.json();
-    const cam = data.cameras.find((c: any) =>
-      typeof c === "string" ? c === camId : c.name === camId
-    );
-
-    if (cam && cam.streaming) startWS();
-    else setHasStream(false);
-
-    // fetch compute mode for display
-    try {
-      const res = await fetch(`${API_BASE}/compute_mode`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) {
-        const j = await res.json();
-        setComputeMode((j.compute || "").toUpperCase());
-      }
-    } catch (err) {
-      console.warn("Failed to fetch compute mode", err);
+  const stopSocketsAndLoops = useCallback(() => {
+    shouldRunRef.current = false;
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
     }
-  };
-
-  // ==========================
-  // 🛰 START WEBSOCKET
-  // ==========================
-  const startWS = () => {
-    const token = getToken();
-    if (!token) return;
-
-    const wsURL = `ws://127.0.0.1:8000/ws/video?cam=${camId}&token=${token}`;
-    const ws = new WebSocket(wsURL);
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setHasStream(true);
-      onStreamStart?.(camId);
-    };
-
-    ws.onmessage = (event) => {
-      const canvas = canvasRef.current;
-      const ctx = canvas?.getContext("2d");
-      if (!canvas || !ctx) return;
-
-      const blob = new Blob([event.data], { type: "image/jpeg" });
-      const img = new Image();
-      img.src = URL.createObjectURL(blob);
-
-      img.onload = () => {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        URL.revokeObjectURL(img.src);
-      };
-    };
-
-    ws.onclose = () => {
-      if (hasStream) setTimeout(startWS, 500);
-    };
-  };
-
-  useEffect(() => {
-    checkStreamStatus();
-    return () => wsRef.current?.close();
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    wsRef.current?.close();
+    wsRef.current = null;
+    awaitingResultRef.current = false;
   }, []);
 
-  // ==========================
-  // 📤 UPLOAD VIDEO
-  // ==========================
-  const uploadVideo = async (e: any) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setIsUploading(true);
-
+  const connectSocket = useCallback(() => {
     const token = getToken();
-    if (isTokenExpired(token)) return handleAuthError();
-
-    const formData = new FormData();
-    formData.append("video", file);
-
-    const res = await fetch(`${API_BASE}/upload?camId=${camId}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: formData,
-    });
-
-    if (res.ok) {
-      addLog(camId, "Video uploaded. Detection started.");
-      startWS();
+    if (!token || isTokenExpired(token)) {
+      handleAuthError();
+      return;
     }
 
-    setIsUploading(false);
-  };
+    const ws = createInferSocket(
+      camId,
+      (incoming) => {
+        awaitingResultRef.current = false;
+        setMetadata(incoming);
 
-  // ==========================
-  // 🛑 STOP VIDEO
-  // ==========================
-  const stopVideo = async () => {
-    const token = getToken();
-    if (isTokenExpired(token)) return handleAuthError();
+        if (incoming.fall_detected) {
+          fallTrueCountRef.current += 1;
+          fallFalseCountRef.current = 0;
+        } else {
+          fallFalseCountRef.current += 1;
+          if (fallFalseCountRef.current >= 3) {
+            fallTrueCountRef.current = 0;
+            acknowledgedFallRef.current = false;
+          }
+        }
 
-    setIsStopping(true);
+        const cooldownPassed = Date.now() - lastPopupAtRef.current > 8000;
+        if (
+          fallTrueCountRef.current >= 2 &&
+          !showAlertRef.current &&
+          !acknowledgedFallRef.current &&
+          cooldownPassed
+        ) {
+          setShowAlert(true);
+          lastPopupAtRef.current = Date.now();
+        }
 
-    const res = await fetch(`${API_BASE}/stop?camId=${camId}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    if (res.ok) {
-      setHasStream(false);
-      wsRef.current?.close();
-      addLog(camId, "Video stopped.");
-      onStreamStop?.(camId);
-    }
-
-    setIsStopping(false);
-  };
-
-  // ==========================
-  // 🔄 POLL VIOLATIONS
-  // ==========================
-  const pollViolations = async () => {
-    if (!hasStream) return;
-
-    const token = getToken();
-    if (isTokenExpired(token)) return handleAuthError();
-
-    const res = await fetch(`${API_BASE}/violations?cam=${camId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    if (!res.ok) return;
-
-    const data = await res.json();
-    if (!data.violations) return;
-
-    data.violations.forEach((v: any) =>
-      addLog(camId, v.message, v.time)
+        const now = Date.now();
+        const logSource = incoming.events && incoming.events.length > 0 ? incoming.events : incoming.dets;
+        for (const det of logSource) {
+          const key = `${camId}:${det.label}`;
+          const lastAt = lastLabelAtRef.current.get(key) ?? 0;
+          if (now - lastAt > 1500) {
+            addLog?.(camId, `${det.label} ${(det.conf * 100).toFixed(1)}%`);
+            lastLabelAtRef.current.set(key, now);
+          }
+        }
+      },
+      () => {
+        awaitingResultRef.current = false;
+        setConnection("closed");
+        if (shouldRunRef.current) {
+          reconnectTimerRef.current = window.setTimeout(connectSocket, 600);
+        }
+      },
     );
-  };
+    setConnection("connecting");
+    ws.onopen = () => {
+      setConnection("open");
+      addLog?.(camId, "Inference websocket connected");
+    };
 
-  useEffect(() => {
-    if (!hasStream) return;
-    const intv = setInterval(pollViolations, 500);
-    return () => clearInterval(intv);
-  }, [hasStream]);
+    wsRef.current = ws;
+  }, [addLog, camId, handleAuthError]);
 
-  // ==========================
-  // 🔥 FALL DETECTION POLL
-  // ==========================
-  const pollFallAlarm = async () => {
-    if (!hasStream) return;
+  const frameLoop = useCallback(async () => {
+    if (!shouldRunRef.current) return;
 
-    const token = getToken();
-    if (isTokenExpired(token)) return handleAuthError();
+    const ws = wsRef.current;
+    const video = videoRef.current;
+    const canvas = captureCanvasRef.current;
 
-    const res = await fetch(`${API_BASE}/alarm?cam=${camId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    if (!res.ok) return;
-
-    const data = await res.json();
-    if (!data.alarm) return;
-
-    // show single alert instance and play alarm (do not add to global logs)
-    if (!fallAlertVisible) {
-      setFallAlertVisible(true);
-
-      if (!stopAlarmRef.current) {
-        stopAlarmRef.current = playAlarmFor10Seconds();
+    if (ws && video && canvas) {
+      const now = performance.now();
+      if (
+        now - lastSentAtRef.current >= SEND_INTERVAL_MS &&
+        video.readyState >= 2 &&
+        ws.readyState === WebSocket.OPEN &&
+        !awaitingResultRef.current &&
+        ws.bufferedAmount < 256_000
+      ) {
+        lastSentAtRef.current = now;
+        awaitingResultRef.current = true;
+        try {
+          await sendCanvasFrame(video, canvas, ws);
+        } catch {
+          awaitingResultRef.current = false;
+        }
       }
     }
-  };
 
-  useEffect(() => {
-    if (!hasStream) return;
-    const intv = setInterval(pollFallAlarm, 500);
-    return () => clearInterval(intv);
-  }, [hasStream]);
+    rafRef.current = requestAnimationFrame(() => {
+      void frameLoop();
+    });
+  }, []);
 
-  // Acknowledge alarm on user close (calls backend to prevent immediate re-alert)
-  const acknowledgeAlarm = async () => {
+  const start = useCallback(() => {
+    if (!videoRef.current || runningRef.current) return;
+    shouldRunRef.current = true;
+    setRunning(true);
+    setUploadAutoStart(camId, true);
+    connectSocket();
+    onStreamStart?.(camId);
+    void frameLoop();
+  }, [camId, connectSocket, frameLoop, onStreamStart]);
+
+  const stop = useCallback(async () => {
+    stopSocketsAndLoops();
+    setRunning(false);
+    setConnection("idle");
+    setShowAlert(false);
+    setUploadAutoStart(camId, false);
+    onStreamStop?.(camId);
+
     const token = getToken();
-    if (!token || isTokenExpired(token)) return handleAuthError();
-
-    try {
-      await fetch(`${API_BASE}/alarm/acknowledge?cam=${camId}`, {
+    if (token && !isTokenExpired(token)) {
+      await fetch(`${API_BASE}/stop?camId=${encodeURIComponent(camId)}`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
-      });
-    } catch (err) {
-      console.error("Failed to acknowledge alarm", err);
+      }).catch(() => undefined);
     }
+    clearUploadSession(camId);
+    setVideoUrl(null);
+    setMetadata(null);
+  }, [camId, onStreamStop, stopSocketsAndLoops]);
 
-    // stop audio and hide alert
-    if (stopAlarmRef.current) {
-      stopAlarmRef.current();
-      stopAlarmRef.current = null;
+  const onUpload = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+
+      const token = getToken();
+      if (!token || isTokenExpired(token)) {
+        handleAuthError();
+        return;
+      }
+
+      setUploading(true);
+
+      const formData = new FormData();
+      formData.append("video", file);
+
+      try {
+        await fetch(`${API_BASE}/upload?camId=${encodeURIComponent(camId)}`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: formData,
+        });
+
+        if (videoUrl) {
+          clearUploadSession(camId);
+        }
+        const objectUrl = URL.createObjectURL(file);
+        setVideoUrl(objectUrl);
+        setUploadSession(camId, { videoUrl: objectUrl, autoStart: true });
+        setMetadata(null);
+        addLog?.(camId, "Local video ready for inference");
+        window.setTimeout(() => {
+          if (!shouldRunRef.current) {
+            shouldRunRef.current = true;
+            setRunning(true);
+            connectSocket();
+            onStreamStart?.(camId);
+            void frameLoop();
+          }
+        }, 100);
+      } finally {
+        setUploading(false);
+      }
+    },
+    [addLog, camId, connectSocket, frameLoop, handleAuthError, onStreamStart, videoUrl],
+  );
+
+  const acknowledgeFall = useCallback(async () => {
+    const token = getToken();
+    if (token && !isTokenExpired(token)) {
+      await fetch(`${API_BASE}/alarm/acknowledge?cam=${encodeURIComponent(camId)}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => undefined);
     }
-    setFallAlertVisible(false);
-  };
+    acknowledgedFallRef.current = true;
+    lastPopupAtRef.current = Date.now();
+    setShowAlert(false);
+  }, [camId]);
 
-  // ==========================
-  // UI
-  // ==========================
+  useEffect(() => {
+    return () => {
+      stopSocketsAndLoops();
+    };
+  }, [stopSocketsAndLoops]);
+
+  useEffect(() => {
+    if (!videoUrl || running) return;
+    const session = getUploadSession(camId);
+    if (session?.autoStart) {
+      const t = window.setTimeout(() => start(), 100);
+      return () => window.clearTimeout(t);
+    }
+  }, [camId, running, start, videoUrl]);
+
+  useEffect(() => {
+    const session = getUploadSession(camId);
+    if (!videoUrl || !session?.autoStart) return;
+
+    const ensure = () => {
+      if (!shouldRunRef.current && !runningRef.current) {
+        start();
+      }
+    };
+
+    const id = window.setInterval(ensure, 1500);
+    ensure();
+    return () => window.clearInterval(id);
+  }, [camId, start, videoUrl]);
+
+  const status = useMemo(() => {
+    if (!videoUrl) return "Upload a file";
+    if (running) return "Inferencing";
+    return "Ready";
+  }, [running, videoUrl]);
+
   return (
-    <div className="relative">
-
-      {/* 🟥 FALL ALERT POPUP */}
-      <FallAlert
-        visible={fallAlertVisible}
-        onClose={acknowledgeAlarm}
-      />
-
-      <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden hover:shadow-md transition-all duration-300">
-
-        {/* Header */}
-        <div className="px-6 py-4 border-b bg-white flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <span className="font-semibold text-gray-900">{camId}</span>
-
-            {computeMode && (
-              <span className="px-2 py-1 text-xs rounded-full bg-gray-100 text-gray-700 border border-gray-200">
-                {computeMode}
-              </span>
-            )}
-
-            {hasStream && (
-              <span className="px-3 py-1 text-xs rounded-full bg-green-50 text-green-700 border border-green-100">
-                Live
-              </span>
-            )}
-          </div>
+    <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+      <div className="mb-3 flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-semibold text-gray-900">{camId} - Upload Source</h3>
+          <p className="text-xs text-gray-500">{title ?? status}</p>
         </div>
-
-        {/* Video / Upload */}
-        <div className="relative bg-gray-100 h-80 flex items-center justify-center">
-
-          {hasStream ? (
-            <>
-              <canvas
-                ref={canvasRef}
-                width={640}
-                height={480}
-                className="w-full h-full object-cover"
-              />
-
-              <button
-                onClick={stopVideo}
-                disabled={isStopping}
-                className="absolute top-4 right-4 bg-black text-white px-4 py-2 rounded shadow"
-              >
-                {isStopping ? "Stopping..." : "Stop"}
-              </button>
-            </>
-          ) : (
-            <label className="flex flex-col items-center justify-center h-full w-full border-2 border-dashed border-gray-300 cursor-pointer bg-white hover:bg-gray-50 transition">
-              <div className="text-center">
-                <span className="text-gray-700 font-medium block mb-1">
-                  Upload video
-                </span>
-                <span className="text-gray-500 text-sm">
-                  MP4, AVI, MOV
-                </span>
-              </div>
-
-              <input hidden type="file" onChange={uploadVideo} />
-
-              {isUploading && (
-                <div className="absolute inset-0 flex items-center justify-center bg-white/70">
-                  <div className="spinner"></div>
-                </div>
-              )}
-            </label>
-          )}
-
-        </div>
+        {running ? (
+          <button onClick={() => void stop()} className="rounded bg-gray-900 px-3 py-1.5 text-xs text-white hover:bg-black">
+            Stop
+          </button>
+        ) : (
+          <button
+            onClick={() => start()}
+            disabled={!videoUrl}
+            className="rounded bg-blue-600 px-3 py-1.5 text-xs text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
+          >
+            Start
+          </button>
+        )}
       </div>
+
+      <div className="relative aspect-video overflow-hidden rounded-lg bg-black">
+        {videoUrl ? (
+          <>
+            <video
+              ref={videoRef}
+              src={videoUrl}
+              className="h-full w-full object-contain"
+              controls
+              autoPlay
+              loop
+              muted
+              playsInline
+              onLoadedData={() => {
+                void videoRef.current?.play().catch(() => undefined);
+              }}
+            />
+            <MetadataRenderer videoRef={videoRef} metadata={metadata} />
+            <FallAlert visible={showAlert} onAcknowledge={() => void acknowledgeFall()} camera={camId} />
+          </>
+        ) : (
+          <label className="flex h-full cursor-pointer items-center justify-center text-center text-sm text-gray-300">
+            <span>{uploading ? "Uploading..." : "Choose video file"}</span>
+            <input type="file" hidden accept="video/*" onChange={onUpload} />
+          </label>
+        )}
+      </div>
+
+      {videoUrl && (
+        <label className="mt-3 mr-2 inline-block cursor-pointer rounded border border-gray-300 px-3 py-1 text-xs text-gray-700 hover:bg-gray-50">
+          Replace file
+          <input type="file" hidden accept="video/*" onChange={onUpload} />
+        </label>
+      )}
+      <span className="text-xs text-gray-500">WS: {connection}</span>
+
+      <canvas ref={captureCanvasRef} className="hidden" />
     </div>
   );
 }
+
+export default memo(VideoTile);

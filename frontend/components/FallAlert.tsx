@@ -1,38 +1,71 @@
 "use client";
 
-import { useEffect } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useRef } from "react";
+import { startContinuousAlarm } from "@/lib/api";
 
 export default function FallAlert({
   visible,
-  onClose,
+  onAcknowledge,
+  camera,
 }: {
   visible: boolean;
-  onClose: () => void;
+  onAcknowledge: () => void;
+  camera: string;
 }) {
+  const stopRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    if (!visible) {
+      stopRef.current?.();
+      stopRef.current = null;
+      return;
+    }
+
+    const audio = new Audio("/sounds/alarm.mp3");
+    audio.loop = true;
+    audio.volume = 1;
+    let fallbackStop: (() => void) | null = null;
+    audio.play().catch(() => {
+      // Fall back to WebAudio beeps when media autoplay is blocked.
+      fallbackStop = startContinuousAlarm(10_000);
+    });
+
+    const timeout = window.setTimeout(() => {
+      audio.pause();
+      audio.currentTime = 0;
+    }, 10_000);
+
+    stopRef.current = () => {
+      window.clearTimeout(timeout);
+      audio.pause();
+      audio.currentTime = 0;
+      fallbackStop?.();
+    };
+
+    return () => {
+      window.clearTimeout(timeout);
+      audio.pause();
+      audio.currentTime = 0;
+      fallbackStop?.();
+    };
+  }, [visible]);
+
   if (!visible) return null;
 
-  // guard for SSR
-  if (typeof document === "undefined") return null;
-
-  const el = (
-    <div
-      className="fixed top-6 left-1/2 -translate-x-1/2 bg-red-600 text-white px-6 py-4 rounded-xl shadow-2xl z-[9999] animate-fade-in flex items-center gap-4 pointer-events-auto"
-      onClick={(e) => e.stopPropagation()}
-    >
-      <span className="font-semibold">⚠️ FALL DETECTED — CHECK IMMEDIATELY</span>
-
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onClose();
-        }}
-        className="ml-4 bg-white text-red-600 font-bold px-3 py-1 rounded-lg hover:bg-gray-100"
-      >
-        Close
-      </button>
+  return (
+    <div className="absolute left-3 right-3 top-3 z-20 rounded-lg border border-red-300 bg-red-50 p-3 shadow">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-semibold text-red-700">Fall detected</p>
+          <p className="text-xs text-red-600">{camera} requires immediate acknowledgment.</p>
+        </div>
+        <button
+          onClick={onAcknowledge}
+          className="rounded bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700"
+        >
+          Acknowledge
+        </button>
+      </div>
     </div>
   );
-
-  return createPortal(el, document.body);
 }
