@@ -1,4 +1,5 @@
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy import Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 
@@ -39,6 +40,15 @@ class Camera(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FrameStat(Base):
+    __tablename__ = "frame_stats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(String, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    violation = Column(Boolean, default=False)
 
 
 # Create tables

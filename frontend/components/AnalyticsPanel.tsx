@@ -1,38 +1,72 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { API_BASE } from "@/lib/api";
+import { useRouter } from "next/navigation";
+import { API_BASE, getToken, isTokenExpired, clearToken } from "@/lib/api";
 
 export default function AnalyticsPanel({ camId }: { camId: string }) {
+  const router = useRouter();
   const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
 
-  const getToken = () => {
-    return document.cookie
-      .split("; ")
-      .find((row) => row.startsWith("token="))
-      ?.split("=")[1];
+  const handleAuthError = () => {
+    clearToken();
+    router.push("/signin");
   };
 
   useEffect(() => {
     const fetchAnalytics = async () => {
       const token = getToken();
 
-      const res = await fetch(`${API_BASE}/analytics?cam=${camId}`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
+      if (isTokenExpired(token)) {
+        handleAuthError();
+        return;
+      }
 
-      if (!res.ok) return;
+      try {
+        const res = await fetch(`${API_BASE}/analytics?cam=${camId}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
 
-      const analytics = await res.json();
-      setData(analytics);
+        if (res.status === 401) {
+          handleAuthError();
+          return;
+        }
+
+        if (!res.ok) {
+          console.error("Failed to fetch analytics", res.status);
+          return;
+        }
+
+        const analytics = await res.json();
+        setData(analytics);
+      } catch (err) {
+        console.error("Error fetching analytics", err);
+      } finally {
+        setLoading(false);
+      }
     };
 
-    fetchAnalytics();
+    if (camId) fetchAnalytics();
   }, [camId]);
 
-  if (!data) return null;
+  if (loading) {
+    return (
+      <div className="w-full">
+        <div className="bg-white rounded-lg p-8 border border-gray-200 shadow-sm text-center text-gray-600">Loading analytics...</div>
+      </div>
+    );
+  }
+
+  if (!data) {
+    return (
+      <div className="w-full">
+        <div className="bg-white rounded-lg p-8 border border-gray-200 shadow-sm text-center text-gray-600">No analytics available</div>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full">

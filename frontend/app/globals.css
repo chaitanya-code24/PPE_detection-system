@@ -1,26 +1,113 @@
 @import "tailwindcss";
 
+/* --------------------------------------------------
+   ROOT THEME (FORCED LIGHT MODE)
+-------------------------------------------------- */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #ffffff;   /* always white */
+  --foreground: #171717;   /* dark text */
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
+/* Disable OS dark mode completely */
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --background: #ffffff;
+    --foreground: #171717;
   }
 }
 
+/* --------------------------------------------------
+   BASE BODY STYLING
+-------------------------------------------------- */
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+  margin: 0;
+  padding: 0;
+}
+
+/* --------------------------------------------------
+   BLACK SPINNER (REUSABLE)
+-------------------------------------------------- */
+.spinner {
+  width: 32px;
+  height: 32px;
+  border: 4px solid #d1d5db;      /* light grey */
+  border-top-color: #111827;      /* black */
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* --------------------------------------------------
+   PURE WHITE GLOBAL LOADING SCREEN
+-------------------------------------------------- */
+.global-loading {
+  position: fixed;
+  inset: 0;
+  background: #ffffff;        /* PURE WHITE */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  z-index: 9999;
+}
+
+.global-loading .loader {
+  width: 45px;
+  height: 45px;
+  border: 5px solid #e5e7eb;
+  border-top-color: #111827;  /* black */
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+/* --------------------------------------------------
+   WHITE PAGE TRANSITION
+-------------------------------------------------- */
+.page-transition-white {
+  position: fixed;
+  inset: 0;
+  background: #ffffff;        /* PURE WHITE */
+  z-index: 9998;
+  animation: fadeOutPage .25s forwards;
+}
+
+@keyframes fadeOutPage {
+  from { opacity: 1; }
+  to { opacity: 0; visibility: hidden; }
+}
+
+/* --------------------------------------------------
+   SKELETON LOADER
+-------------------------------------------------- */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    #e5e7eb 0%,
+    #f3f4f6 50%,
+    #e5e7eb 100%
+  );
+  background-size: 200% 100%;
+  animation: skeletonPulse 1.2s infinite linear;
+  border-radius: 6px;
+}
+
+@keyframes skeletonPulse {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translate(-50%, -10px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.25s ease-out;
 }

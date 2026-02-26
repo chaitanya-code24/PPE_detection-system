@@ -8,6 +8,9 @@ import { API_BASE, getToken, clearToken, isTokenExpired } from "@/lib/api";
 export default function CamerasPage() {
   const router = useRouter();
   const [cameras, setCameras] = useState<Array<{name: string, streaming: boolean}>>([]);
+  const [devices, setDevices] = useState<Array<{device:number,label:string}>>([]);
+  const [discovering, setDiscovering] = useState(false);
+  const [computeMode, setComputeMode] = useState<string | null>(null);
   const [newCam, setNewCam] = useState("");
   const [toast, setToast] = useState<{message: string, type: "success" | "error" | "warning" | "info"} | null>(null);
 
@@ -47,8 +50,77 @@ export default function CamerasPage() {
           : c)
         : [];
       setCameras(cameraList);
+      // fetch compute mode
+      try {
+        const cm = await fetch(`${API_BASE}/compute_mode`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (cm.ok) {
+          const j = await cm.json();
+          setComputeMode((j.compute || "").toUpperCase());
+        }
+      } catch (err) {
+        console.warn("Failed to fetch compute mode", err);
+      }
     } catch (error) {
       console.error("Failed to fetch cameras:", error);
+    }
+  };
+
+  const discoverDevices = async () => {
+    const token = getToken();
+    if (isTokenExpired(token)) return handleAuthError();
+    setDiscovering(true);
+    try {
+      const res = await fetch(`${API_BASE}/discover_devices?max_index=6`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 401) return handleAuthError();
+      if (!res.ok) return;
+      const data = await res.json();
+      setDevices(data.devices || []);
+    } catch (err) {
+      console.error("discover failed", err);
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const startLocal = async (name: string, device: number) => {
+    const token = getToken();
+    if (isTokenExpired(token)) return handleAuthError();
+    try {
+      const res = await fetch(`${API_BASE}/start_local?name=${encodeURIComponent(name)}&device=${device}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 401) return handleAuthError();
+      if (!res.ok) {
+        setToast({ message: "Failed to start local camera", type: "error" });
+        return;
+      }
+      setToast({ message: "Local camera started", type: "success" });
+      fetchCameras();
+    } catch (err) {
+      console.error(err);
+      setToast({ message: "Failed to start local camera", type: "error" });
+    }
+  };
+
+  const stopStream = async (name: string) => {
+    const token = getToken();
+    if (isTokenExpired(token)) return handleAuthError();
+    try {
+      const res = await fetch(`${API_BASE}/stop?camId=${encodeURIComponent(name)}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.status === 401) return handleAuthError();
+      setToast({ message: "Stream stopped", type: "success" });
+      fetchCameras();
+    } catch (err) {
+      console.error(err);
+      setToast({ message: "Failed to stop stream", type: "error" });
     }
   };
 
@@ -164,10 +236,39 @@ export default function CamerasPage() {
             onClick={addCamera}
             className="bg-gray-900 hover:bg-gray-800 text-white px-6 py-3 rounded transform transition duration-150 ease-in-out hover:scale-[1.03] active:scale-95 font-semibold"
           >
-            Add Camera
+            Add Screen
+          </button>
+          <button
+            onClick={discoverDevices}
+            className="ml-3 bg-white border border-gray-300 text-gray-900 px-4 py-3 rounded shadow-sm hover:shadow transition"
+          >
+            {discovering ? "Discovering..." : "Discover Devices"}
           </button>
         </div>
       </div>
+
+      {/* Discovered Devices */}
+      {devices.length > 0 && (
+        <div className="bg-white border border-gray-200 rounded-lg p-6 mb-8 shadow-sm">
+          <h3 className="text-lg font-semibold mb-4">Discovered Devices</h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {devices.map((d) => (
+              <div key={d.device} className="p-3 border rounded">
+                <p className="text-sm text-gray-700">{d.label}</p>
+                <p className="text-xs text-gray-500 mb-2">Index: {d.device}</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => startLocal(newCam || `cam-${d.device}`, d.device)}
+                    className="bg-gray-900 hover:bg-gray-800 text-white px-3 py-2 rounded text-sm"
+                  >
+                    Start Local (as {newCam || `cam-${d.device}`})
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Cameras List */}
       <div>
@@ -190,11 +291,18 @@ export default function CamerasPage() {
                 {/* Camera Info */}
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-lg font-semibold text-gray-900">{cam.name}</h3>
-                  {cam.streaming && (
-                    <span className="text-xs font-medium text-green-700 bg-green-50 px-3 py-1 rounded-full border border-green-100">
-                      Streaming
-                    </span>
-                  )}
+                  <div className="flex items-center gap-2">
+                    {computeMode && (
+                      <span className="text-xs font-medium text-gray-700 bg-gray-100 px-2 py-1 rounded-full border border-gray-100">
+                        {computeMode}
+                      </span>
+                    )}
+                    {cam.streaming && (
+                      <span className="text-xs font-medium text-green-700 bg-green-50 px-3 py-1 rounded-full border border-green-100">
+                        Streaming
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {/* Status */}

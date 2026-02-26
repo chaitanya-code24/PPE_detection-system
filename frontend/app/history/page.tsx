@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { API_BASE, getToken, clearToken, isTokenExpired } from "@/lib/api";
+import HistorySkeleton from "@/components/HistorySkeleton";
 
 export default function HistoryPage() {
   const router = useRouter();
@@ -19,7 +20,6 @@ export default function HistoryPage() {
   const fetchCameras = async () => {
     const token = getToken();
 
-    // Check if token is expired
     if (isTokenExpired(token)) {
       handleAuthError();
       return;
@@ -27,27 +27,19 @@ export default function HistoryPage() {
 
     try {
       const res = await fetch(`${API_BASE}/cameras`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
       });
 
-      if (res.status === 401) {
-        handleAuthError();
-        return;
-      }
-
-      if (!res.ok) return;
+      if (res.status === 401) return handleAuthError();
 
       const data = await res.json();
       const camList = Array.isArray(data.cameras)
-        ? data.cameras.map((c: any) => typeof c === 'string' ? c : c.name)
+        ? data.cameras.map((c: any) => (typeof c === "string" ? c : c.name))
         : [];
+
       setCameras(camList);
 
-      if (camList.length > 0) {
-        setCamera(camList[0]);
-      }
+      if (camList.length > 0) setCamera(camList[0]);
     } catch (error) {
       console.error("Failed to fetch cameras:", error);
     }
@@ -60,7 +52,6 @@ export default function HistoryPage() {
 
     const token = getToken();
 
-    // Check if token is expired
     if (isTokenExpired(token)) {
       handleAuthError();
       setLoading(false);
@@ -69,21 +60,10 @@ export default function HistoryPage() {
 
     try {
       const res = await fetch(`${API_BASE}/history?cam=${selectedCam}`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
       });
 
-      if (res.status === 401) {
-        handleAuthError();
-        setLoading(false);
-        return;
-      }
-
-      if (!res.ok) {
-        setLoading(false);
-        return;
-      }
+      if (res.status === 401) return handleAuthError();
 
       const data = await res.json();
       setHistory(data.history || []);
@@ -99,9 +79,7 @@ export default function HistoryPage() {
   }, []);
 
   useEffect(() => {
-    if (camera) {
-      fetchHistory(camera);
-    }
+    if (camera) fetchHistory(camera);
   }, [camera]);
 
   return (
@@ -111,14 +89,18 @@ export default function HistoryPage() {
         <h1 className="text-3xl font-semibold text-gray-900 mb-2">
           Violation History
         </h1>
-        <p className="text-gray-600">View all detected violations and events</p>
+        <p className="text-gray-600">
+          View all detected violations and events
+        </p>
       </div>
 
       {cameras.length === 0 ? (
         <div className="flex items-center justify-center py-32">
           <div className="text-center">
             <p className="text-gray-600 text-lg mb-2">No cameras configured</p>
-            <p className="text-gray-500 text-sm">Add cameras from the Camera Management page to view history</p>
+            <p className="text-gray-500 text-sm">
+              Add cameras from the Camera Management page to view history
+            </p>
           </div>
         </div>
       ) : (
@@ -142,7 +124,7 @@ export default function HistoryPage() {
             </select>
           </div>
 
-          {/* History Table */}
+          {/* History Table / Skeleton */}
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden shadow-sm">
             {/* Header */}
             <div className="px-6 py-4 border-b border-gray-100">
@@ -155,13 +137,13 @@ export default function HistoryPage() {
             </div>
 
             {loading ? (
-              <div className="p-12 text-center">
-                <p className="text-gray-600">Loading history...</p>
-              </div>
+              <HistorySkeleton />
             ) : history.length === 0 ? (
               <div className="p-12 text-center">
                 <p className="text-gray-600 text-lg">No records found</p>
-                <p className="text-gray-500 text-sm mt-2">Violations will appear here as they are detected</p>
+                <p className="text-gray-500 text-sm mt-2">
+                  Violations will appear here as they are detected
+                </p>
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -173,6 +155,7 @@ export default function HistoryPage() {
                       <th className="text-right px-6 py-3 text-gray-900 font-semibold">Time</th>
                     </tr>
                   </thead>
+
                   <tbody>
                     {history.map((item, index) => {
                       const isViolation = item.message.includes("NO-");
