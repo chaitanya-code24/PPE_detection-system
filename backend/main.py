@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -14,10 +16,23 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from ultralytics import YOLO
+from dotenv import load_dotenv
 
-from models_db import Camera, SessionLocal, User, Violation
+from models_db import (
+    Camera,
+    EmailConfig,
+    EmailDeliveryLog,
+    SessionLocal,
+    SmsConfig,
+    SmsDeliveryLog,
+    User,
+    Violation,
+)
+from notifications import send_smtp_email, send_twilio_sms
 from schemas import AlarmResponse, InferResponse
 from workers import InferenceWorker
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
@@ -25,6 +40,7 @@ ALGORITHM = "HS256"
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 FALL_CLASS = os.getenv("FALL_CLASS", "Fall-Detected")
 MAX_METADATA_STALENESS_SEC = float(os.getenv("MAX_METADATA_STALENESS_SEC", "1.0"))
+REQUIRE_WS_AUTH = os.getenv("REQUIRE_WS_AUTH", "true").strip().lower() in {"1", "true", "yes"}
 
 app = FastAPI(title="PPE + Fall Detection API")
 security = HTTPBearer()
@@ -58,8 +74,10 @@ except Exception:
 
 workers: dict[str, InferenceWorker] = {}
 fall_detected_store: dict[str, dict[str, Any]] = {}
+ws_connect_count: dict[str, int] = {}
 CAMERA_MODES = {"upload", "live"}
 FALL_CLEAR_REQUIRED_FRAMES = 2
+E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 
 
 def utc_now_iso() -> str:
@@ -78,7 +96,8 @@ def default_alarm_state() -> dict[str, Any]:
     }
 
 
-def update_alarm_state(cam_id: str, fall_detected: bool, timestamp: str) -> None:
+def update_alarm_state(cam_id: str, fall_detected: bool, timestamp: str) -> bool:
+    new_incident = False
     state = fall_detected_store.setdefault(cam_id, default_alarm_state())
 
     if fall_detected:
@@ -92,6 +111,7 @@ def update_alarm_state(cam_id: str, fall_detected: bool, timestamp: str) -> None
             state["timestamp"] = timestamp
             state["last_alerted"] = timestamp
             state["incident"] = int(state.get("incident", 0)) + 1
+            new_incident = True
         elif not state.get("acknowledged", False):
             state["detected"] = True
     else:
@@ -101,6 +121,97 @@ def update_alarm_state(cam_id: str, fall_detected: bool, timestamp: str) -> None
             state["active"] = False
             state["detected"] = False
             state["acknowledged"] = False
+    return new_incident
+
+
+def get_sms_config(db: Session) -> SmsConfig | None:
+    return db.query(SmsConfig).order_by(SmsConfig.id.asc()).first()
+
+
+def get_email_config(db: Session) -> EmailConfig | None:
+    return db.query(EmailConfig).order_by(EmailConfig.id.asc()).first()
+
+
+def send_fall_sms_async(cam_id: str, timestamp: str) -> None:
+    db = SessionLocal()
+    try:
+        cfg = get_sms_config(db)
+        if not cfg or not cfg.enabled:
+            return
+        sender = env_sms_sender()
+        receiver = (cfg.receiver_number or "").strip()
+        if not sender or not receiver:
+            return
+        if not E164_RE.fullmatch(sender) or not E164_RE.fullmatch(receiver):
+            return
+    finally:
+        db.close()
+
+    body = f"[PPE Alert] Fall detected on {cam_id} at {timestamp}. Please check immediately."
+
+    def _send() -> None:
+        ok, detail, data = send_twilio_sms(sender, receiver, body)
+        db2 = SessionLocal()
+        try:
+            db2.add(
+                SmsDeliveryLog(
+                    camera_id=cam_id,
+                    to_number=receiver,
+                    message=body,
+                    status="success" if ok else "failed",
+                    detail=detail,
+                    provider_id=str((data or {}).get("sid", "")),
+                    is_test=False,
+                )
+            )
+            db2.commit()
+        finally:
+            db2.close()
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def send_fall_email_async(cam_id: str, timestamp: str) -> None:
+    db = SessionLocal()
+    try:
+        cfg = get_email_config(db)
+        if not cfg or not cfg.enabled:
+            return
+        sender = env_email_sender()
+        receiver = (cfg.receiver_email or "").strip()
+        if not sender or not receiver:
+            return
+    finally:
+        db.close()
+
+    subject = f"PPE Alert - Fall detected on {cam_id}"
+    body = (
+        f"Fall incident detected.\n\n"
+        f"Camera: {cam_id}\n"
+        f"Timestamp: {timestamp}\n\n"
+        f"Please acknowledge and review immediately."
+    )
+
+    def _send() -> None:
+        ok, detail, _ = send_smtp_email(sender, receiver, subject, body)
+        db2 = SessionLocal()
+        try:
+            db2.add(
+                EmailDeliveryLog(
+                    camera_id=cam_id,
+                    to_email=receiver,
+                    subject=subject,
+                    message=body,
+                    status="success" if ok else "failed",
+                    detail=detail,
+                    is_test=False,
+                )
+            )
+            db2.commit()
+        finally:
+            db2.close()
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def hash_password(password: str) -> str:
@@ -179,6 +290,7 @@ def get_worker(cam_id: str) -> InferenceWorker:
     )
     worker.start()
     workers[cam_id] = worker
+    ws_connect_count.setdefault(cam_id, 0)
     fall_detected_store.setdefault(cam_id, default_alarm_state())
     return worker
 
@@ -207,6 +319,46 @@ def persist_detections(cam_id: str, dets: list[dict[str, Any]]) -> None:
 class AuthSchema(BaseModel):
     username: str
     password: str
+
+
+class SmsConfigSchema(BaseModel):
+    receiver_number: str
+    enabled: bool = True
+
+
+class SmsTestSchema(BaseModel):
+    message: str | None = None
+
+
+class EmailConfigSchema(BaseModel):
+    receiver_email: str
+    enabled: bool = True
+
+
+class EmailTestSchema(BaseModel):
+    subject: str | None = None
+    message: str | None = None
+
+
+def validate_sms_numbers(sender: str, receiver: str) -> None:
+    if not E164_RE.fullmatch(sender):
+        raise HTTPException(
+            status_code=400,
+            detail="Sender number must be E.164 format, e.g. +15551234567",
+        )
+    if not E164_RE.fullmatch(receiver):
+        raise HTTPException(
+            status_code=400,
+            detail="Receiver number must be E.164 format, e.g. +15557654321",
+        )
+
+
+def env_sms_sender() -> str:
+    return os.getenv("TWILIO_FROM_NUMBER", "").strip()
+
+
+def env_email_sender() -> str:
+    return os.getenv("SMTP_FROM_EMAIL", "").strip() or os.getenv("SMTP_USER", "").strip()
 
 
 @app.on_event("shutdown")
@@ -270,9 +422,14 @@ async def ws_infer(ws: WebSocket):
 
     cam_id = ws.query_params.get("cam") or "default"
     token = ws.query_params.get("token")
-    _username = validate_ws_token(token)
+    username = validate_ws_token(token)
+    if REQUIRE_WS_AUTH and not username:
+        await ws.send_json({"error": "unauthorized", "detail": "Invalid or missing token"})
+        await ws.close(code=1008)
+        return
 
     worker = get_worker(cam_id)
+    ws_connect_count[cam_id] = ws_connect_count.get(cam_id, 0) + 1
 
     while True:
         try:
@@ -314,17 +471,100 @@ async def ws_infer(ws: WebSocket):
             to_persist = metadata.get("events") or []
             if to_persist:
                 persist_detections(cam_id, to_persist)
-            update_alarm_state(
+            new_incident = update_alarm_state(
                 cam_id=cam_id,
                 fall_detected=bool(metadata.get("fall_detected")),
                 timestamp=metadata.get("timestamp", utc_now_iso()),
             )
+            if new_incident:
+                send_fall_sms_async(
+                    cam_id=cam_id,
+                    timestamp=metadata.get("timestamp", utc_now_iso()),
+                )
+                send_fall_email_async(
+                    cam_id=cam_id,
+                    timestamp=metadata.get("timestamp", utc_now_iso()),
+                )
 
             await ws.send_json(metadata)
         except WebSocketDisconnect:
             break
-        except Exception:
+        except RuntimeError:
+            # Usually indicates socket is closing/closed.
+            break
+        except Exception as exc:
+            print(f"[ws/infer] camera={cam_id} error={type(exc).__name__}: {exc}")
+            try:
+                await ws.send_json(
+                    {
+                        "dets": [],
+                        "fall_detected": False,
+                        "timestamp": utc_now_iso(),
+                        "frame_width": None,
+                        "frame_height": None,
+                        "error": "ws_processing_error",
+                    }
+                )
+            except Exception:
+                pass
             await asyncio.sleep(0.01)
+
+
+@app.get("/camera_metrics")
+def camera_metrics(cam: str, user: str = Depends(get_current_user)):
+    worker = workers.get(cam)
+    if not worker:
+        return {
+            "camera_id": cam,
+            "streaming": False,
+            "ws_reconnects": ws_connect_count.get(cam, 0),
+            "uptime_sec": 0,
+            "frames_received": 0,
+            "frames_inferred": 0,
+            "fps_in": 0,
+            "fps_out": 0,
+            "latency_p50_ms": 0,
+            "latency_p95_ms": 0,
+            "dropped_frames": 0,
+            "queue_depth": 0,
+        }
+
+    base = worker.metrics()
+    base["streaming"] = True
+    base["ws_reconnects"] = ws_connect_count.get(cam, 0)
+    return base
+
+
+@app.get("/camera_metrics/all")
+def camera_metrics_all(db: Session = Depends(get_db), user: str = Depends(get_current_user)):
+    cams = db.query(Camera).all()
+    out = []
+    for cam in cams:
+        cam_id = cam.name
+        worker = workers.get(cam_id)
+        if not worker:
+            out.append(
+                {
+                    "camera_id": cam_id,
+                    "streaming": False,
+                    "ws_reconnects": ws_connect_count.get(cam_id, 0),
+                    "uptime_sec": 0,
+                    "frames_received": 0,
+                    "frames_inferred": 0,
+                    "fps_in": 0,
+                    "fps_out": 0,
+                    "latency_p50_ms": 0,
+                    "latency_p95_ms": 0,
+                    "dropped_frames": 0,
+                    "queue_depth": 0,
+                }
+            )
+            continue
+        item = worker.metrics()
+        item["streaming"] = True
+        item["ws_reconnects"] = ws_connect_count.get(cam_id, 0)
+        out.append(item)
+    return {"metrics": out}
 
 
 @app.get("/compute_mode")
@@ -410,6 +650,236 @@ def acknowledge_alarm(cam: str, user: str = Depends(get_current_user)):
     state["acknowledged"] = True
     state["ack_time"] = utc_now_iso()
     return {"message": "Alarm acknowledged"}
+
+
+@app.get("/notifications/sms")
+def get_sms_notification_config(user: str = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        cfg = get_sms_config(db)
+        sender = env_sms_sender()
+        if not cfg:
+            return {"sender_number": sender, "receiver_number": "", "enabled": False}
+        return {
+            "sender_number": sender,
+            "receiver_number": cfg.receiver_number or "",
+            "enabled": bool(cfg.enabled),
+        }
+    finally:
+        db.close()
+
+
+@app.post("/notifications/sms")
+def save_sms_notification_config(payload: SmsConfigSchema, user: str = Depends(get_current_user)):
+    sender = env_sms_sender()
+    if not sender:
+        raise HTTPException(status_code=400, detail="TWILIO_FROM_NUMBER is not configured in backend .env")
+    receiver = payload.receiver_number.strip()
+    validate_sms_numbers(sender, receiver)
+
+    db = SessionLocal()
+    try:
+        cfg = get_sms_config(db)
+        if not cfg:
+            cfg = SmsConfig(
+                sender_number=sender,
+                receiver_number=receiver,
+                enabled=payload.enabled,
+            )
+            db.add(cfg)
+        else:
+            # Sender is backend-owned; sync DB value for compatibility only.
+            cfg.sender_number = sender
+            cfg.receiver_number = receiver
+            cfg.enabled = payload.enabled
+        db.commit()
+        return {"message": "SMS notification config saved"}
+    finally:
+        db.close()
+
+
+@app.post("/notifications/sms/test")
+def send_sms_test(payload: SmsTestSchema, user: str = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        cfg = get_sms_config(db)
+        if not cfg or not cfg.enabled:
+            raise HTTPException(status_code=400, detail="SMS notifications are disabled")
+        sender = env_sms_sender()
+        receiver = (cfg.receiver_number or "").strip()
+        if not sender or not receiver:
+            raise HTTPException(status_code=400, detail="Sender/receiver number is not configured")
+        validate_sms_numbers(sender, receiver)
+    finally:
+        db.close()
+
+    msg = (payload.message or "").strip() or f"[PPE Alert Test] Configuration test at {utc_now_iso()}."
+    ok, detail, data = send_twilio_sms(sender, receiver, msg)
+    db2 = SessionLocal()
+    try:
+        db2.add(
+            SmsDeliveryLog(
+                camera_id="",
+                to_number=receiver,
+                message=msg,
+                status="success" if ok else "failed",
+                detail=detail,
+                provider_id=str((data or {}).get("sid", "")),
+                is_test=True,
+            )
+        )
+        db2.commit()
+    finally:
+        db2.close()
+
+    if not ok:
+        raise HTTPException(status_code=500, detail=detail)
+    return {"message": "Test SMS sent", "provider_id": data.get("sid")}
+
+
+@app.get("/notifications/sms/logs")
+def get_sms_logs(limit: int = 50, user: str = Depends(get_current_user)):
+    safe_limit = max(1, min(limit, 200))
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(SmsDeliveryLog)
+            .order_by(SmsDeliveryLog.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+        return {
+            "logs": [
+                {
+                    "id": row.id,
+                    "camera_id": row.camera_id,
+                    "to_number": row.to_number,
+                    "message": row.message,
+                    "status": row.status,
+                    "detail": row.detail,
+                    "provider_id": row.provider_id,
+                    "is_test": bool(row.is_test),
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+                for row in rows
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/notifications/email")
+def get_email_notification_config(user: str = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        cfg = get_email_config(db)
+        sender = env_email_sender()
+        if not cfg:
+            return {"sender_email": sender, "receiver_email": "", "enabled": False}
+        return {
+            "sender_email": sender,
+            "receiver_email": cfg.receiver_email or "",
+            "enabled": bool(cfg.enabled),
+        }
+    finally:
+        db.close()
+
+
+@app.post("/notifications/email")
+def save_email_notification_config(payload: EmailConfigSchema, user: str = Depends(get_current_user)):
+    sender = env_email_sender()
+    if not sender:
+        raise HTTPException(status_code=400, detail="SMTP_FROM_EMAIL or SMTP_USER is not configured in backend .env")
+    receiver = payload.receiver_email.strip()
+    if "@" not in sender:
+        raise HTTPException(status_code=400, detail="Sender email is invalid")
+    if "@" not in receiver:
+        raise HTTPException(status_code=400, detail="Receiver email is invalid")
+
+    db = SessionLocal()
+    try:
+        cfg = get_email_config(db)
+        if not cfg:
+            cfg = EmailConfig(sender_email=sender, receiver_email=receiver, enabled=payload.enabled)
+            db.add(cfg)
+        else:
+            # Sender is backend-owned; sync DB value for compatibility only.
+            cfg.sender_email = sender
+            cfg.receiver_email = receiver
+            cfg.enabled = payload.enabled
+        db.commit()
+        return {"message": "Email notification config saved"}
+    finally:
+        db.close()
+
+
+@app.post("/notifications/email/test")
+def send_email_test(payload: EmailTestSchema, user: str = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        cfg = get_email_config(db)
+        if not cfg or not cfg.enabled:
+            raise HTTPException(status_code=400, detail="Email notifications are disabled")
+        sender = env_email_sender()
+        receiver = (cfg.receiver_email or "").strip()
+        if not sender or not receiver:
+            raise HTTPException(status_code=400, detail="Sender/receiver email is not configured")
+    finally:
+        db.close()
+
+    subject = (payload.subject or "").strip() or "PPE Alert Test Email"
+    message = (payload.message or "").strip() or f"PPE alert email channel test at {utc_now_iso()}."
+    ok, detail, _ = send_smtp_email(sender, receiver, subject, message)
+    db2 = SessionLocal()
+    try:
+        db2.add(
+            EmailDeliveryLog(
+                camera_id="",
+                to_email=receiver,
+                subject=subject,
+                message=message,
+                status="success" if ok else "failed",
+                detail=detail,
+                is_test=True,
+            )
+        )
+        db2.commit()
+    finally:
+        db2.close()
+    if not ok:
+        raise HTTPException(status_code=500, detail=detail)
+    return {"message": "Test email sent"}
+
+
+@app.get("/notifications/email/logs")
+def get_email_logs(limit: int = 50, user: str = Depends(get_current_user)):
+    safe_limit = max(1, min(limit, 200))
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(EmailDeliveryLog)
+            .order_by(EmailDeliveryLog.created_at.desc())
+            .limit(safe_limit)
+            .all()
+        )
+        return {
+            "logs": [
+                {
+                    "id": row.id,
+                    "camera_id": row.camera_id,
+                    "to_email": row.to_email,
+                    "subject": row.subject,
+                    "message": row.message,
+                    "status": row.status,
+                    "detail": row.detail,
+                    "is_test": bool(row.is_test),
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                }
+                for row in rows
+            ]
+        }
+    finally:
+        db.close()
 
 
 @app.get("/cameras")

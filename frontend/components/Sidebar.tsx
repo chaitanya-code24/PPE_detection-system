@@ -6,8 +6,10 @@ import { clearToken } from "@/lib/api";
 
 const navItems = [
   { name: "Dashboard", path: "/dashboard" },
+  { name: "Health", path: "/health" },
   { name: "Analytics", path: "/analytics" },
   { name: "History", path: "/history" },
+  { name: "Notifications", path: "/notifications" },
   { name: "Cameras", path: "/cameras" },
 ];
 

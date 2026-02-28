@@ -51,5 +51,53 @@ class FrameStat(Base):
     violation = Column(Boolean, default=False)
 
 
+class SmsConfig(Base):
+    __tablename__ = "sms_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sender_number = Column(String, default="")
+    receiver_number = Column(String, default="")
+    enabled = Column(Boolean, default=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class EmailConfig(Base):
+    __tablename__ = "email_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sender_email = Column(String, default="")
+    receiver_email = Column(String, default="")
+    enabled = Column(Boolean, default=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SmsDeliveryLog(Base):
+    __tablename__ = "sms_delivery_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(String, index=True, default="")
+    to_number = Column(String, default="")
+    message = Column(String, default="")
+    status = Column(String, default="failed")  # success | failed
+    detail = Column(String, default="")
+    provider_id = Column(String, default="")
+    is_test = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class EmailDeliveryLog(Base):
+    __tablename__ = "email_delivery_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    camera_id = Column(String, index=True, default="")
+    to_email = Column(String, default="")
+    subject = Column(String, default="")
+    message = Column(String, default="")
+    status = Column(String, default="failed")  # success | failed
+    detail = Column(String, default="")
+    is_test = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 # Create tables
 Base.metadata.create_all(bind=engine)

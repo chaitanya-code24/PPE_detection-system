@@ -30,8 +30,10 @@ export function middleware(request: NextRequest) {
 
   // Check if trying to access protected routes
   const isProtectedRoute = pathname.startsWith("/dashboard") ||
+    pathname.startsWith("/health") ||
     pathname.startsWith("/analytics") ||
     pathname.startsWith("/history") ||
+    pathname.startsWith("/notifications") ||
     pathname.startsWith("/cameras");
 
   // Redirect to login if:
@@ -53,8 +55,10 @@ export function middleware(request: NextRequest) {
 export const config = {
   matcher: [
     "/dashboard/:path*",
+    "/health/:path*",
     "/analytics/:path*",
     "/history/:path*",
+    "/notifications/:path*",
     "/cameras/:path*",
     "/signin",
     "/signup",

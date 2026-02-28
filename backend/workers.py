@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -42,6 +43,14 @@ class InferenceWorker:
         self.event_cooldown_sec = float(os.getenv("EVENT_COOLDOWN_SEC", "3.0"))
         self._label_streak: dict[str, int] = {}
         self._last_event_at: dict[str, float] = {}
+        self._stats_lock = threading.Lock()
+        self._started_at = time.time()
+        self._frames_received = 0
+        self._frames_inferred = 0
+        self._queue_dropped = 0
+        self._in_ts = deque(maxlen=600)
+        self._out_ts = deque(maxlen=600)
+        self._lat_ms = deque(maxlen=400)
 
         self._queue: queue.Queue[tuple[int, bytes]] = queue.Queue(maxsize=2)
         self._results: dict[int, dict[str, Any]] = {}
@@ -75,14 +84,27 @@ class InferenceWorker:
         with self._condition:
             self._seq += 1
             seq = self._seq
+        now = time.time()
+        with self._stats_lock:
+            self._frames_received += 1
+            self._in_ts.append(now)
 
-        if self._queue.full():
+        try:
+            self._queue.put_nowait((seq, frame_bytes))
+        except queue.Full:
+            # Drop oldest frame to keep latency bounded under burst load.
             try:
                 self._queue.get_nowait()
+                with self._stats_lock:
+                    self._queue_dropped += 1
             except queue.Empty:
                 pass
-
-        self._queue.put((seq, frame_bytes))
+            try:
+                self._queue.put_nowait((seq, frame_bytes))
+            except queue.Full:
+                # If still full due to a race, drop this frame as well.
+                with self._stats_lock:
+                    self._queue_dropped += 1
         return seq
 
     def await_result(self, seq: int, timeout: float = 0.75) -> dict[str, Any] | None:
@@ -132,8 +154,11 @@ class InferenceWorker:
                 continue
 
             try:
+                t0 = time.perf_counter()
                 payload = self._infer(frame)
+                infer_ms = (time.perf_counter() - t0) * 1000.0
             except Exception as exc:
+                infer_ms = 0.0
                 payload = {
                     "dets": [],
                     "fall_detected": False,
@@ -142,6 +167,12 @@ class InferenceWorker:
                     "frame_height": int(frame.shape[0]),
                     "error": f"inference_failed:{type(exc).__name__}",
                 }
+            now = time.time()
+            with self._stats_lock:
+                self._frames_inferred += 1
+                self._out_ts.append(now)
+                if infer_ms > 0:
+                    self._lat_ms.append(infer_ms)
 
             self._latest = payload
             self._publish(payload)
@@ -154,6 +185,29 @@ class InferenceWorker:
                     for key in oldest:
                         self._results.pop(key, None)
                 self._condition.notify_all()
+
+    def metrics(self) -> dict[str, Any]:
+        with self._stats_lock:
+            now = time.time()
+            window = 10.0
+            fps_in = sum(1 for t in self._in_ts if now - t <= window) / window
+            fps_out = sum(1 for t in self._out_ts if now - t <= window) / window
+            lat = sorted(self._lat_ms)
+            p50 = lat[len(lat) // 2] if lat else 0.0
+            p95 = lat[min(len(lat) - 1, int(len(lat) * 0.95))] if lat else 0.0
+            uptime = max(0.0, now - self._started_at)
+            return {
+                "camera_id": self.camera_id,
+                "uptime_sec": round(uptime, 1),
+                "frames_received": self._frames_received,
+                "frames_inferred": self._frames_inferred,
+                "fps_in": round(fps_in, 2),
+                "fps_out": round(fps_out, 2),
+                "latency_p50_ms": round(p50, 2),
+                "latency_p95_ms": round(p95, 2),
+                "dropped_frames": int(self._queue_dropped),
+                "queue_depth": int(self._queue.qsize()),
+            }
 
     def _infer(self, frame) -> dict[str, Any]:
         dets: list[dict[str, Any]] = []
