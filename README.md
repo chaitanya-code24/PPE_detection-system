@@ -1,4 +1,4 @@
-# PPE + Fall Detection Monitoring System
+# Realtime-PPE-Fall-Detection
 
 Real-time PPE compliance and fall-detection platform built with a `FastAPI` backend and a `Next.js` frontend. Video stays in the browser for playback, while the backend only receives sampled JPEG frames over WebSocket, runs YOLO inference on GPU, and returns metadata for overlays, alerts, history, and analytics.
 
