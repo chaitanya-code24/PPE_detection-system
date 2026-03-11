@@ -35,12 +35,15 @@ from workers import InferenceWorker
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
+# Core runtime settings are intentionally hardcoded here rather than driven by .env.
+SECRET_KEY = "change-me"
 ALGORITHM = "HS256"
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-FALL_CLASS = os.getenv("FALL_CLASS", "Fall-Detected")
-MAX_METADATA_STALENESS_SEC = float(os.getenv("MAX_METADATA_STALENESS_SEC", "1.0"))
-REQUIRE_WS_AUTH = os.getenv("REQUIRE_WS_AUTH", "true").strip().lower() in {"1", "true", "yes"}
+REDIS_URL = "redis://127.0.0.1:6379/0"
+FALL_CLASS = "Fall-Detected"
+MAX_METADATA_STALENESS_SEC = 1.0
+REQUIRE_WS_AUTH = True
+PPE_MODEL_PATH = "PPE_detection.pt"
+FALL_MODEL_PATH = "fall_detection.pt"
 
 app = FastAPI(title="PPE + Fall Detection API")
 security = HTTPBearer()
@@ -61,8 +64,8 @@ app.add_middleware(
 if not torch.cuda.is_available():
     raise RuntimeError("GPU inference is mandatory. CUDA device not available.")
 
-model_ppe = YOLO(os.getenv("PPE_MODEL_PATH", "best.pt"))
-model_fall = YOLO(os.getenv("FALL_MODEL_PATH", "last.pt"))
+model_ppe = YOLO(PPE_MODEL_PATH)
+model_fall = YOLO(FALL_MODEL_PATH)
 model_ppe.to("cuda")
 model_fall.to("cuda")
 try:

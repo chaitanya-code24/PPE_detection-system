@@ -6,10 +6,6 @@ env/
 users.db
 *.db
 
-# YOLO runs
-runs/
-*.pt
-
 # Videos
 *.mp4
 

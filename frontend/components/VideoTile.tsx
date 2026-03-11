@@ -4,6 +4,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEve
 import { useRouter } from "next/navigation";
 import { API_BASE, clearToken, getToken, isTokenExpired } from "@/lib/api";
 import FallAlert from "@/components/FallAlert";
+import InferenceLoadingOverlay from "@/components/InferenceLoadingOverlay";
 import MetadataRenderer from "@/components/MetadataRenderer";
 import { InferMetadata, createInferSocket, sendCanvasFrame } from "@/lib/wsClient";
 import { clearUploadSession, getUploadSession, setUploadAutoStart, setUploadSession } from "@/lib/streamSession";
@@ -69,6 +70,7 @@ function VideoTile({ camId, title, addLog, onStreamStart, onStreamStop }: VideoT
     wsRef.current?.close();
     wsRef.current = null;
     awaitingResultRef.current = false;
+    setMetadata(null);
   }, []);
 
   const connectSocket = useCallback(() => {
@@ -168,6 +170,7 @@ function VideoTile({ camId, title, addLog, onStreamStart, onStreamStop }: VideoT
   const start = useCallback(() => {
     if (!videoRef.current || runningRef.current) return;
     shouldRunRef.current = true;
+    setMetadata(null);
     setRunning(true);
     setUploadAutoStart(camId, true);
     connectSocket();
@@ -291,6 +294,8 @@ function VideoTile({ camId, title, addLog, onStreamStart, onStreamStop }: VideoT
     return "Ready";
   }, [running, videoUrl]);
 
+  const showInferenceLoading = running && metadata === null;
+
   return (
     <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
       <div className="mb-3 flex items-center justify-between">
@@ -329,6 +334,7 @@ function VideoTile({ camId, title, addLog, onStreamStart, onStreamStop }: VideoT
                 void videoRef.current?.play().catch(() => undefined);
               }}
             />
+            <InferenceLoadingOverlay visible={showInferenceLoading} label="Waiting for detection boxes..." />
             <MetadataRenderer videoRef={videoRef} metadata={metadata} />
             <FallAlert visible={showAlert} onAcknowledge={() => void acknowledgeFall()} camera={camId} />
           </>

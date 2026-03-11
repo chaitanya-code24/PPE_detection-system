@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
 import threading
 import time
@@ -17,6 +16,17 @@ try:
     import redis
 except Exception:
     redis = None
+
+
+PPE_CONF = 0.2
+FALL_CONF = 0.2
+YOLO_IOU = 0.45
+VIOLATION_CONF = 0.55
+FALL_EVENT_CONF = 0.45
+PERSON_CONF = 0.35
+COMPLIANT_CONF = 0.2
+EVENT_CONFIRM_FRAMES = 3
+EVENT_COOLDOWN_SEC = 3.0
 
 
 class InferenceWorker:
@@ -36,11 +46,11 @@ class InferenceWorker:
         self.ppe_model = ppe_model
         self.fall_model = fall_model
         self.fall_class = fall_class
-        self.ppe_conf = float(os.getenv("PPE_CONF", "0.2"))
-        self.fall_conf = float(os.getenv("FALL_CONF", "0.2"))
-        self.iou = float(os.getenv("YOLO_IOU", "0.45"))
-        self.confirm_frames = int(os.getenv("EVENT_CONFIRM_FRAMES", "3"))
-        self.event_cooldown_sec = float(os.getenv("EVENT_COOLDOWN_SEC", "3.0"))
+        self.ppe_conf = PPE_CONF
+        self.fall_conf = FALL_CONF
+        self.iou = YOLO_IOU
+        self.confirm_frames = EVENT_CONFIRM_FRAMES
+        self.event_cooldown_sec = EVENT_COOLDOWN_SEC
         self._label_streak: dict[str, int] = {}
         self._last_event_at: dict[str, float] = {}
         self._stats_lock = threading.Lock()
@@ -302,12 +312,12 @@ class InferenceWorker:
     def _label_threshold(self, label: str, default_conf: float) -> float:
         norm = label.strip().lower().replace("_", "-")
         if "no-hardhat" in norm or "no-vest" in norm:
-            return float(os.getenv("VIOLATION_CONF", "0.55"))
+            return VIOLATION_CONF
         if "fall" in norm:
-            return float(os.getenv("FALL_EVENT_CONF", "0.45"))
+            return FALL_EVENT_CONF
         if "person" in norm:
-            return float(os.getenv("PERSON_CONF", "0.35"))
-        return float(os.getenv("COMPLIANT_CONF", str(default_conf)))
+            return PERSON_CONF
+        return COMPLIANT_CONF
 
     def _extract_events(self, dets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         now = time.time()

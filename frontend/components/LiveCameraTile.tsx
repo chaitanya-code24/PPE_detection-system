@@ -2,6 +2,7 @@
 
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { API_BASE, getToken, isTokenExpired } from "@/lib/api";
+import InferenceLoadingOverlay from "@/components/InferenceLoadingOverlay";
 import MetadataRenderer from "@/components/MetadataRenderer";
 import FallAlert from "@/components/FallAlert";
 import { InferMetadata, createInferSocket, sendCanvasFrame } from "@/lib/wsClient";
@@ -49,6 +50,7 @@ function LiveCameraTile({ camId, title, addLog }: LiveCameraTileProps) {
     wsRef.current?.close();
     wsRef.current = null;
     awaitingResultRef.current = false;
+    setMetadata(null);
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
@@ -122,6 +124,7 @@ function LiveCameraTile({ camId, title, addLog }: LiveCameraTileProps) {
       }
 
       shouldRunRef.current = true;
+      setMetadata(null);
       setRunning(true);
       setLiveSession(camId, { stream, autoStart: true });
 
@@ -181,6 +184,7 @@ function LiveCameraTile({ camId, title, addLog }: LiveCameraTileProps) {
     }
 
     shouldRunRef.current = true;
+    setMetadata(null);
     setRunning(true);
 
     wsRef.current = createInferSocket(camId, (incoming) => {
@@ -245,6 +249,8 @@ function LiveCameraTile({ camId, title, addLog }: LiveCameraTileProps) {
     };
   }, [camId, detachRuntime, resumeLive]);
 
+  const showInferenceLoading = running && metadata === null;
+
   return (
     <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
       <div className="mb-3 flex items-center justify-between">
@@ -266,6 +272,7 @@ function LiveCameraTile({ camId, title, addLog }: LiveCameraTileProps) {
 
       <div className="relative aspect-video overflow-hidden rounded-lg bg-black">
         <video ref={videoRef} className="h-full w-full object-contain" muted playsInline />
+        <InferenceLoadingOverlay visible={showInferenceLoading} label="Waiting for detection boxes..." />
         <MetadataRenderer videoRef={videoRef} metadata={metadata} />
         <FallAlert visible={showAlert} onAcknowledge={() => void acknowledgeFall()} camera={camId} />
       </div>
